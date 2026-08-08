@@ -16,7 +16,9 @@ type Querier interface {
 	// give an honest "index is still warming up" answer instead of empty results.
 	CountMessageEmbeddings(ctx context.Context, roomID int64) (int64, error)
 	// Total unread, so the UI can say "summarising the latest 200 of 4,312" honestly
-	// rather than silently truncating.
+	// rather than silently truncating. Must apply the SAME three conditions as
+	// ListUnreadMessages — if the count and the list disagree about what "unread"
+	// means, the "(N unread — summarising the most recent M)" notice lies.
 	CountUnreadMessages(ctx context.Context, arg CountUnreadMessagesParams) (int64, error)
 	// created_at is passed in (not left to DEFAULT now()) so the stored time is when
 	// the user actually sent the message, not when the persister happened to insert it.
@@ -35,6 +37,16 @@ type Querier interface {
 	ListRecentMessages(ctx context.Context, roomID int64) ([]ListRecentMessagesRow, error)
 	ListRooms(ctx context.Context) ([]Room, error)
 	// The messages a user missed, oldest-first, capped.
+	//
+	// "Missed" is three conditions, not two. The timestamp alone says "arrived after
+	// you left", which is also true of messages YOU sent on returning — they land on
+	// the far side of your own watermark. You have read what you wrote, so $3
+	// excludes the asker. Without it /catchup answers "what happened here?" when the
+	// question is "what did I miss?".
+	//
+	// Note we do NOT advance the watermark when a user sends. Talking is not reading:
+	// you can reconnect, fire off a message without scrolling up, and still be owed a
+	// summary of everything above it.
 	//
 	// The cap is not cosmetic. Prompt tokens are the expensive half of generation on
 	// the homelab box (~71 tok/s prefill vs ~4.7 tok/s decode), and the model's

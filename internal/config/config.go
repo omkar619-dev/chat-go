@@ -35,7 +35,7 @@ func Load() Config {
 		// pinned LAN address wins: fewer moving parts, lower latency.
 		// Override with OLLAMA_URL — use the tailnet address from off-LAN, or
 		// localhost if you run Ollama on this machine.
-		OllamaURL: getenv("OLLAMA_URL", "http://192.168.29.124:11434"),
+		OllamaURL: getenv("OLLAMA_URL", "http://192.168.29.30:11434"),
 		// all-minilm outputs 384 numbers, matching vector(384) in schema.sql.
 		// Changing the model means changing that column AND re-indexing everything.
 		EmbedModel: getenv("EMBED_MODEL", "all-minilm"),

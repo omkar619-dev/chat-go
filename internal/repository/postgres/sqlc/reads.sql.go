@@ -13,18 +13,21 @@ import (
 
 const countUnreadMessages = `-- name: CountUnreadMessages :one
 SELECT count(*) FROM messages
-WHERE room_id = $1 AND created_at > $2
+WHERE room_id = $1 AND created_at > $2 AND user_id <> $3
 `
 
 type CountUnreadMessagesParams struct {
 	RoomID    int64              `json:"room_id"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UserID    int64              `json:"user_id"`
 }
 
 // Total unread, so the UI can say "summarising the latest 200 of 4,312" honestly
-// rather than silently truncating.
+// rather than silently truncating. Must apply the SAME three conditions as
+// ListUnreadMessages — if the count and the list disagree about what "unread"
+// means, the "(N unread — summarising the most recent M)" notice lies.
 func (q *Queries) CountUnreadMessages(ctx context.Context, arg CountUnreadMessagesParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countUnreadMessages, arg.RoomID, arg.CreatedAt)
+	row := q.db.QueryRow(ctx, countUnreadMessages, arg.RoomID, arg.CreatedAt, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -56,7 +59,7 @@ FROM (
     SELECT m.id, m.room_id, m.user_id, u.username, m.body, m.created_at
     FROM messages m
     JOIN users u ON u.id = m.user_id
-    WHERE m.room_id = $1 AND m.created_at > $2
+    WHERE m.room_id = $1 AND m.created_at > $2 AND m.user_id <> $3
     ORDER BY m.id DESC
     LIMIT 200
 ) AS unread
@@ -66,6 +69,7 @@ ORDER BY unread.id
 type ListUnreadMessagesParams struct {
 	RoomID    int64              `json:"room_id"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UserID    int64              `json:"user_id"`
 }
 
 type ListUnreadMessagesRow struct {
@@ -78,13 +82,23 @@ type ListUnreadMessagesRow struct {
 
 // The messages a user missed, oldest-first, capped.
 //
+// "Missed" is three conditions, not two. The timestamp alone says "arrived after
+// you left", which is also true of messages YOU sent on returning — they land on
+// the far side of your own watermark. You have read what you wrote, so $3
+// excludes the asker. Without it /catchup answers "what happened here?" when the
+// question is "what did I miss?".
+//
+// Note we do NOT advance the watermark when a user sends. Talking is not reading:
+// you can reconnect, fire off a message without scrolling up, and still be owed a
+// summary of everything above it.
+//
 // The cap is not cosmetic. Prompt tokens are the expensive half of generation on
 // the homelab box (~71 tok/s prefill vs ~4.7 tok/s decode), and the model's
 // context is 2048 tokens. Someone away for a month must not push 5,000 messages
 // into it. We take the NEWEST 200 unread and flip them back to chronological —
 // the same inner/outer trick ListRecentMessages uses.
 func (q *Queries) ListUnreadMessages(ctx context.Context, arg ListUnreadMessagesParams) ([]ListUnreadMessagesRow, error) {
-	rows, err := q.db.Query(ctx, listUnreadMessages, arg.RoomID, arg.CreatedAt)
+	rows, err := q.db.Query(ctx, listUnreadMessages, arg.RoomID, arg.CreatedAt, arg.UserID)
 	if err != nil {
 		return nil, err
 	}

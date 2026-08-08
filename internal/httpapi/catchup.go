@@ -54,7 +54,7 @@ func (h *Handlers) streamCatchup(ctx context.Context, conn *websocket.Conn, room
 		// No watermark at all: they've never had a socket open here, so there is no
 		// "gap" to describe. Fall back to the last 50 — the right answer for a
 		// first visit, and exactly what this feature did before 5.4.
-		h.summariseRecent(ctx, conn, roomID)
+		h.summariseRecent(ctx, conn, roomID, userID)
 		return
 	case err != nil:
 		log.Printf("catchup watermark (room %d, user %d): %v", roomID, userID, err)
@@ -62,12 +62,13 @@ func (h *Handlers) streamCatchup(ctx context.Context, conn *websocket.Conn, room
 		return
 	}
 
-	// 2. How much did they actually miss?
+	// 2. How much did they actually miss? UserID excludes their own messages —
+	//    you have read what you wrote.
 	total, err := h.Queries.CountUnreadMessages(ctx, sqlc.CountUnreadMessagesParams{
-		RoomID: roomID, CreatedAt: lastRead,
+		RoomID: roomID, CreatedAt: lastRead, UserID: userID,
 	})
 	if err != nil {
-		log.Printf("catchup count (room %d): %v", roomID, err)
+		log.Printf("catchup count (room %d, user %d): %v", roomID, userID, err)
 		_ = writeFrame(ctx, conn, frame{Type: frameError, Text: "could not read this room's history"})
 		return
 	}
@@ -77,6 +78,10 @@ func (h *Handlers) streamCatchup(ctx context.Context, conn *websocket.Conn, room
 	// /catchup always summarised the last 50 messages — including the ones you
 	// had just finished reading.
 	if total == 0 {
+		// Logged like the other outcomes. This branch is the cheapest and most
+		// common one, and until it said so there was no way to tell "answered
+		// instantly" apart from "never ran" when reading the gateway's output.
+		log.Printf("catchup (room %d, user %d): nothing unread", roomID, userID)
 		_ = writeFrame(ctx, conn, frame{Type: frameSummaryChunk,
 			Text: "You're all caught up — nothing new since you were last here."})
 		_ = writeFrame(ctx, conn, frame{Type: frameSummaryDone})
@@ -84,10 +89,10 @@ func (h *Handlers) streamCatchup(ctx context.Context, conn *websocket.Conn, room
 	}
 
 	unread, err := h.Queries.ListUnreadMessages(ctx, sqlc.ListUnreadMessagesParams{
-		RoomID: roomID, CreatedAt: lastRead,
+		RoomID: roomID, CreatedAt: lastRead, UserID: userID,
 	})
 	if err != nil || len(unread) == 0 {
-		log.Printf("catchup unread (room %d): %v", roomID, err)
+		log.Printf("catchup unread (room %d, user %d): %v", roomID, userID, err)
 		_ = writeFrame(ctx, conn, frame{Type: frameError, Text: "could not read this room's history"})
 		return
 	}
@@ -103,16 +108,16 @@ func (h *Handlers) streamCatchup(ctx context.Context, conn *websocket.Conn, room
 	for _, m := range unread {
 		fmt.Fprintf(&b, "%s: %s\n", m.Username, m.Body)
 	}
-	h.streamSummary(ctx, conn, roomID, b.String(), len(unread))
+	h.streamSummary(ctx, conn, roomID, userID, b.String(), len(unread))
 }
 
 // summariseRecent is the pre-5.4 behaviour: summarise the last 50 messages,
 // regardless of who's asking. Kept as the fallback for a user with no read
 // watermark yet, where "what did you miss" has no meaningful answer.
-func (h *Handlers) summariseRecent(ctx context.Context, conn *websocket.Conn, roomID int64) {
+func (h *Handlers) summariseRecent(ctx context.Context, conn *websocket.Conn, roomID, userID int64) {
 	history, err := h.Queries.ListRecentMessages(ctx, roomID)
 	if err != nil {
-		log.Printf("catchup history (room %d): %v", roomID, err)
+		log.Printf("catchup history (room %d, user %d): %v", roomID, userID, err)
 		_ = writeFrame(ctx, conn, frame{Type: frameError, Text: "could not read this room's history"})
 		return
 	}
@@ -126,12 +131,16 @@ func (h *Handlers) summariseRecent(ctx context.Context, conn *websocket.Conn, ro
 	for _, m := range history {
 		fmt.Fprintf(&b, "%s: %s\n", m.Username, m.Body)
 	}
-	h.streamSummary(ctx, conn, roomID, b.String(), len(history))
+	h.streamSummary(ctx, conn, roomID, userID, b.String(), len(history))
 }
 
 // streamSummary runs the model and pumps each fragment down the socket as it's
 // produced. Shared by both paths above so there's one place that talks to the LLM.
-func (h *Handlers) streamSummary(ctx context.Context, conn *websocket.Conn, roomID int64, transcript string, count int) {
+//
+// userID is carried purely for the log lines. A summary is per-user, so a room id
+// alone can't tell two concurrent catch-ups apart — and once there's more than one
+// gateway process, reading these logs is the only way to follow a single request.
+func (h *Handlers) streamSummary(ctx context.Context, conn *websocket.Conn, roomID, userID int64, transcript string, count int) {
 	genCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
 
@@ -143,12 +152,12 @@ func (h *Handlers) streamSummary(ctx context.Context, conn *websocket.Conn, room
 		return writeFrame(ctx, conn, frame{Type: frameSummaryChunk, Text: chunk})
 	})
 	if err != nil {
-		log.Printf("catchup (room %d): %v", roomID, err)
+		log.Printf("catchup (room %d, user %d): %v", roomID, userID, err)
 		_ = writeFrame(ctx, conn, frame{Type: frameError, Text: "the summary failed partway through"})
 		return
 	}
 
-	log.Printf("catchup (room %d): summarised %d messages in %s",
-		roomID, count, time.Since(started).Round(time.Second))
+	log.Printf("catchup (room %d, user %d): summarised %d messages in %s",
+		roomID, userID, count, time.Since(started).Round(time.Second))
 	_ = writeFrame(ctx, conn, frame{Type: frameSummaryDone})
 }

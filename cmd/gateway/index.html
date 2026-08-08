@@ -157,10 +157,22 @@
 
     function send() {
       const input = document.getElementById('input');
-      if (input.value && ws) {
-        ws.send(input.value);   // send raw text; the server tags it with our username
+      if (!input.value || !ws) return;
+
+      // A slash command is a request to the GATEWAY, not a message to the room.
+      // The server already knows that — it intercepts "/catchup" instead of
+      // publishing it. The browser has to agree, or it fires the command off
+      // without preparing anywhere to put the answer, and the reply streams into
+      // a hidden panel. Same normalisation as the server's EqualFold/TrimSpace:
+      // both ends must agree on what counts as the command.
+      if (input.value.trim().toLowerCase() === '/catchup') {
         input.value = '';
+        catchup();
+        return;
       }
+
+      ws.send(input.value);   // send raw text; the server tags it with our username
+      input.value = '';
     }
 
     function addMessage(username, body, sentAt) {
@@ -203,6 +215,12 @@
 
     function appendSummary(text) {
       const panel = document.getElementById('summary');
+      // A chunk arriving is itself proof the panel is needed, so unhide it here
+      // rather than relying on whoever triggered the summary to have done it.
+      // Visibility that depends on the SENDER remembering to prepare the RECEIVER
+      // breaks the moment a new trigger is added — which is exactly how the typed
+      // "/catchup" ended up streaming into an invisible div.
+      panel.style.display = 'block';
       // The first chunk replaces the "Summarising…" placeholder; every chunk after
       // it appends. That's what makes the answer visibly assemble itself.
       if (awaitingFirstChunk) {
