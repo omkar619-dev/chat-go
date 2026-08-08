@@ -31,6 +31,14 @@ func main() {
 	// 1. Load config (env vars, with local-dev defaults).
 	cfg := config.Load()
 
+	// Refuse to run on a placeholder signing key. Every other setting has a safe
+	// local default; this one does not, because the failure is silent — see
+	// config.RequireJWTSecret. Checked before anything is dialled so a
+	// misconfigured instance dies immediately rather than serving forgeable tokens.
+	if err := cfg.RequireJWTSecret(); err != nil {
+		log.Fatalf("refusing to start: %v", err)
+	}
+
 	// 2. Root context that cancels on Ctrl+C / SIGTERM — the basis of graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

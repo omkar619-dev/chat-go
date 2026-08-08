@@ -1,6 +1,14 @@
 package config
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
+
+// devJWTSecret is the placeholder that used to be a silent default. It stays
+// named here so the gateway can refuse it BY NAME: an unset secret and an
+// explicitly configured placeholder are the same mistake and must fail alike.
+const devJWTSecret = "dev-change-me"
 
 // Config holds everything the gateway needs to start, read from the environment.
 type Config struct {
@@ -23,7 +31,7 @@ func Load() Config {
 		HTTPAddr:    getenv("HTTP_ADDR", ":8090"), // :8080 is taken by the local Atlassian app
 		DatabaseURL: getenv("DATABASE_URL", "postgres://chat:chat_dev@localhost:5433/chat?sslmode=disable"),
 		RedisAddr:   getenv("REDIS_ADDR", "localhost:6381"),
-		JWTSecret:   getenv("JWT_SECRET", "dev-change-me"),
+		JWTSecret:   getenv("JWT_SECRET", devJWTSecret),
 		KafkaBroker: getenv("KAFKA_BROKER", "localhost:9094"),
 		KafkaTopic:  getenv("KAFKA_TOPIC", "chat.messages"),
 		// Ollama runs on the homelab Old PC. This address is a DHCP lease that moved
@@ -44,6 +52,30 @@ func Load() Config {
 		// safe to swap while hunting for one that's fast enough on the host.
 		ChatModel: getenv("CHAT_MODEL", "qwen2.5:1.5b"),
 	}
+}
+
+// RequireJWTSecret refuses to accept a missing or placeholder signing key.
+//
+// This is the one setting the process will not guess at, because the old default
+// failed OPEN and did so invisibly. With JWT_SECRET unset, every instance fell
+// back to the SAME placeholder — so logins succeeded, tokens minted on one
+// gateway validated on another, and nothing anywhere errored, while a string
+// published in a public repository signed every token in the system. A
+// misconfiguration that behaves perfectly is more dangerous than one that
+// crashes, because nothing ever prompts you to go and look.
+//
+// Only the gateway signs and verifies tokens. The persister, indexer and bot
+// never touch a JWT, which is why this is a separate call rather than part of
+// Load() — requiring it everywhere would be security theatre with a real cost.
+func (c Config) RequireJWTSecret() error {
+	switch c.JWTSecret {
+	case "", devJWTSecret:
+		return fmt.Errorf("JWT_SECRET is unset or still the placeholder %q: set it to a "+
+			"random value, and to the SAME value on every gateway — tokens signed by one "+
+			"instance are verified by recomputing the signature on whichever instance the "+
+			"load balancer picks next", devJWTSecret)
+	}
+	return nil
 }
 
 // getenv returns the environment variable if it's set and non-empty,
