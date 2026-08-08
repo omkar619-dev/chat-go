@@ -143,14 +143,43 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
-		if err := h.Redis.Publish(ctx, channel, payload).Err(); err != nil {
-			return
+		// A dual-write has FOUR outcomes, not two, and the sender needs to know which
+		// one happened. Redis is the DELIVERY plane; Kafka is the RECORD. They fail
+		// independently and the failures mean different things:
+		//
+		//   redis ok,   kafka ok   -> delivered and recorded. Say nothing.
+		//   redis ok,   kafka fail -> everyone saw it; a refresh loses it forever.
+		//   redis fail, kafka ok   -> nobody saw it live; it's in history on reconnect.
+		//   both fail              -> the message does not exist. Only the sender can act.
+		//
+		// NEITHER failure closes the socket any more. This used to `return` on a Redis
+		// error, which killed the connection, skipped the Kafka write entirely, and told
+		// the user nothing — and the browser's onclose does nothing once opened, so the
+		// page went on looking healthy while every later message vanished. A transport
+		// failure must cost latency, not data.
+		redisErr := h.Redis.Publish(ctx, channel, payload).Err()
+		if redisErr != nil {
+			log.Printf("redis publish (room %d, user %d): %v", roomID, claims.UserID, redisErr)
 		}
-		// Dual-write: also append to the durable Kafka log, keyed by room_id so a
-		// room's messages stay ordered. Best-effort — a Kafka hiccup must not drop
-		// a message that was already delivered live over Redis.
-		if err := h.Producer.Publish(ctx, strconv.FormatInt(roomID, 10), payload); err != nil {
-			log.Printf("kafka publish (room %d): %v", roomID, err)
+
+		// Keyed by room_id (Hash balancer) so one room's messages land in one
+		// partition and stay ordered for the persister.
+		kafkaErr := h.Producer.Publish(ctx, strconv.FormatInt(roomID, 10), payload)
+		if kafkaErr != nil {
+			log.Printf("kafka publish (room %d, user %d): %v", roomID, claims.UserID, kafkaErr)
+		}
+
+		// Silence is only correct when both planes worked.
+		switch {
+		case redisErr != nil && kafkaErr != nil:
+			_ = writeFrame(ctx, conn, frame{Type: frameError,
+				Text: "Not sent — nothing was saved or delivered. Please send it again."})
+		case redisErr != nil:
+			_ = writeFrame(ctx, conn, frame{Type: frameError,
+				Text: "Saved, but not delivered live — others will see it when they reconnect."})
+		case kafkaErr != nil:
+			_ = writeFrame(ctx, conn, frame{Type: frameError,
+				Text: "Delivered, but not saved — this message will vanish from history on refresh."})
 		}
 	}
 }

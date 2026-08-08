@@ -29,6 +29,9 @@
                background: #eff6ff; border-left: 3px solid #2563eb; border-radius: 4px;
                white-space: pre-wrap; }
     #summary.waiting { color: #6b7280; font-style: italic; }
+    /* An error must not look like a summary. Same panel, unmistakably different. */
+    #summary.error { background: #fef2f2; border-left-color: #dc2626; color: #991b1b;
+                     font-weight: 500; }
   </style>
 </head>
 <body>
@@ -133,7 +136,7 @@
             awaitingFirstChunk = false;
             break;
           case 'error':
-            showSummary(frame.text, true);
+            showError(frame.text);
             awaitingFirstChunk = false;
             break;
           default:
@@ -210,11 +213,24 @@
       const panel = document.getElementById('summary');
       panel.style.display = 'block';
       panel.classList.toggle('waiting', !!waiting);
+      panel.classList.remove('error');   // a new summary must not stay tinted red
+      panel.textContent = text;
+    }
+
+    // Errors share the panel but never share its look. The server sends these when a
+    // send only half-succeeded — delivered but not saved, saved but not delivered, or
+    // neither — so they must not be mistakable for a summary.
+    function showError(text) {
+      const panel = document.getElementById('summary');
+      panel.style.display = 'block';
+      panel.classList.remove('waiting');
+      panel.classList.add('error');
       panel.textContent = text;
     }
 
     function appendSummary(text) {
       const panel = document.getElementById('summary');
+      panel.classList.remove('error');   // ditto, coming the other way
       // A chunk arriving is itself proof the panel is needed, so unhide it here
       // rather than relying on whoever triggered the summary to have done it.
       // Visibility that depends on the SENDER remembering to prepare the RECEIVER
