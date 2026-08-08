@@ -1,5 +1,5 @@
-# Local data plane for chat-go — Phase 0.
-# Kafka is intentionally NOT here yet; it arrives in Phase 2 when we produce to it.
+# Local data plane for chat-go.
+# postgres + redis from Phase 0, kafka from Phase 2, nginx from Phase 6.1.
 services:
   postgres:
     image: pgvector/pgvector:0.7.4-pg16   # Postgres 16 with pgvector baked in (same family as news-feed)
@@ -54,6 +54,22 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     volumes:
       - kafka_data:/var/lib/kafka/data
+
+  # Load balancer over the gateway processes (Phase 6.1). Config and reasoning
+  # live in deploy/nginx.conf. Started on demand, not part of the data plane:
+  #   docker compose up -d nginx
+  #
+  # The gateways run on the HOST under `go run`, so nginx reaches them through
+  # host.docker.internal. Docker Desktop provides that name automatically;
+  # extra_hosts adds it on Linux so this still works on the homelab.
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro   # :ro — nginx never writes it
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   pg_data:
