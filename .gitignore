@@ -1,0 +1,18 @@
+# local env / secrets — never commit these
+.env
+*.pem
+
+# build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+bob.json
+body.json
+room.json
+wrongpw.json
