@@ -39,7 +39,16 @@ func main() {
 	hold := flag.Duration("hold", 30*time.Second, "how long to hold the connections open")
 	publish := flag.Int("publish", 0, "messages to publish once connections settle (0 = skip the fan-out measurement)")
 	rate := flag.Int("rate", 10, "messages per second while publishing")
+	size := flag.Int("size", 40, "message body size in bytes")
 	redisAddr := flag.String("redis", "127.0.0.1:6381", "redis address, read-only, for INFO sampling")
+	// Connections that connect and then never read, to exercise the hub's
+	// eviction policy. They log in as a DIFFERENT user on purpose: the read
+	// watermark is per (room, user), so sharing a user with the healthy
+	// connections would let their clean disconnects advance it and hide whether
+	// the evicted one was correctly skipped.
+	stall := flag.Int("stall", 0, "connections that connect and never read")
+	stallUser := flag.String("stalluser", "bob", "user for the stalled connections")
+	stallPass := flag.String("stallpass", "bobpass123", "password for the stalled connections")
 	flag.Parse()
 
 	// Ctrl+C cancels everything at once: the dial loop, every read loop, the hold.
@@ -67,6 +76,19 @@ func main() {
 	wsURL := strings.Replace(*base, "http", "ws", 1) +
 		fmt.Sprintf("/ws?token=%s&room=%d", token, *room)
 
+	// A second identity for the stalled connections, so the watermark check is
+	// not confounded by the healthy connections sharing a user.
+	stallURL := wsURL
+	if *stall > 0 {
+		stallToken, err := login(ctx, *base, *stallUser, *stallPass)
+		if err != nil {
+			log.Fatalf("login %s: %v", *stallUser, err)
+		}
+		stallURL = strings.Replace(*base, "http", "ws", 1) +
+			fmt.Sprintf("/ws?token=%s&room=%d", stallToken, *room)
+		log.Printf("%d of %d connections will stall as %q", *stall, *conns, *stallUser)
+	}
+
 	// The hold is a context rather than a timer so that it reaches every blocked
 	// Read simultaneously. conn.Read on a silent room blocks indefinitely, so a
 	// timer the read loop only checks between messages would never fire.
@@ -92,7 +114,13 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 
-			c, _, err := websocket.Dial(holdCtx, wsURL, nil)
+			// The first `stall` connections are the deliberately broken ones.
+			url, stalled := wsURL, id < *stall
+			if stalled {
+				url = stallURL
+			}
+
+			c, _, err := websocket.Dial(holdCtx, url, nil)
 			if err != nil {
 				// Only the first few. Otherwise 1000 failures print 1000 identical
 				// lines and bury whatever else the run was trying to tell you.
@@ -105,6 +133,16 @@ func main() {
 
 			open.Add(1)
 			defer open.Add(-1)
+
+			// A stalled connection is open and healthy at the TCP level but never
+			// reads. The server's socket buffer fills, its write blocks, the hub's
+			// per-socket channel fills behind it, and the hub should then evict
+			// this subscription and close the socket. Simulates a client on a
+			// train, or one whose tab the browser has throttled to death.
+			if stalled {
+				<-holdCtx.Done()
+				return
+			}
 
 			// Drain and count. Every connection receives the room's history replay
 			// on connect and then whatever is published afterwards. We never decode
@@ -129,7 +167,10 @@ func main() {
 	// The fan-out measurement. Runs while every subscriber is still connected,
 	// then releases the hold so the read loops exit and wg.Wait() returns.
 	if *publish > 0 {
-		publishPhase(holdCtx, wsURL, *redisAddr, *publish, *rate, int(int64(*conns)-failed.Load()), &frames)
+		// Only the READING connections count as subscribers for the expected-frame
+		// arithmetic — stalled ones are supposed to be evicted and receive nothing.
+		readers := int(int64(*conns)-failed.Load()) - *stall
+		publishPhase(holdCtx, wsURL, *redisAddr, *publish, *rate, *size, readers, &frames)
 		cancelHold()
 	}
 
@@ -159,7 +200,7 @@ func main() {
 // immune to how loaded the machine is — a contended CPU slows everything
 // uniformly, it does not turn 500 deliveries into 250 — which is what makes this
 // measurement trustworthy on a laptop that is also running the client.
-func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, subs int, frames *atomic.Int64) {
+func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, size, subs int, frames *atomic.Int64) {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 
@@ -193,8 +234,10 @@ func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, sub
 		}
 	}()
 
-	// Fixed-size body so bytes-per-message is comparable across runs.
-	body := strings.Repeat("x", 40)
+	// Fixed-size body so bytes-per-message is comparable across runs. Larger
+	// bodies fill a stalled socket's kernel buffer sooner, which is what makes
+	// the eviction test finish in seconds rather than thousands of messages.
+	body := strings.Repeat("x", size)
 	interval := time.Second / time.Duration(rate)
 	log.Printf("publishing %d messages at %d/s to %d subscribers", count, rate, subs)
 

@@ -144,6 +144,28 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// 6b. Eviction watcher.
+	//
+	//     This CANNOT live at the end of Pump A. An evicted reader is by
+	//     definition blocked inside writeFrame, so it never returns to the top of
+	//     its range loop to notice sub.C closing — it stays blocked until its
+	//     context dies, which measured at 37 seconds of the client sitting
+	//     connected and receiving nothing. A separate goroutine has nothing to
+	//     block on, so it fires immediately.
+	//
+	//     CloseNow, not Close: a reader too slow to drain its buffer will not
+	//     complete a close handshake either, and Close would block waiting for one.
+	//     Closing the socket unblocks Pump A's write and ends Pump B's read, which
+	//     unwinds the handler into the watermark defer — where Slow() correctly
+	//     declines to mark the undelivered messages as read.
+	go func() {
+		select {
+		case <-sub.Evicted():
+			conn.CloseNow()
+		case <-ctx.Done():
+		}
+	}()
+
 	// 7. Pump B: this socket -> Redis. Read what the user typed, tag it with
 	//    their username, and publish it so every subscriber (incl. them) gets it.
 	for {

@@ -102,6 +102,27 @@
     // WebSocket, swap to the chat view. Shared by a fresh login AND the
     // auto-reconnect on load, so the logic lives in exactly one place.
     async function connect(token) {
+      // Tear down any previous socket FIRST.
+      //
+      // connect() has two callers — the DOMContentLoaded auto-reconnect and
+      // login() — so it can run twice in one page life. Reassigning `ws` without
+      // closing the old one leaves that socket open with its own onmessage
+      // handler still attached, and every message then renders twice. It also
+      // costs the server a second hub member for a client that only exists once.
+      //
+      // onclose is cleared before closing so the OLD socket's handler doesn't
+      // fire and bounce us back to the login form mid-reconnect.
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
+
+      // The server replays the last 50 messages on EVERY connect, so start from
+      // an empty list — otherwise a reconnect appends a second copy of history
+      // on top of the one already on screen.
+      document.getElementById('messages').textContent = '';
+
       // Make sure we're a member of the room (idempotent — safe to repeat).
       await fetch('/rooms/' + ROOM + '/join', {
         method: 'POST',

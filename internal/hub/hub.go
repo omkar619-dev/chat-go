@@ -28,6 +28,7 @@ package hub
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -50,12 +51,28 @@ type Subscription struct {
 	// on its own; the caller does not need a separate done signal.
 	C <-chan []byte
 
+	// evicted is closed ONLY when the hub drops this subscription for being too
+	// slow. Never closed on a normal Close.
+	//
+	// Necessary because the reader cannot be relied on to notice C closing: by
+	// definition an evicted reader is blocked writing to its socket, so it is not
+	// at the top of its range loop and will not get there until its context dies.
+	// A cleanup path that only runs when the goroutine is unstuck is no cleanup
+	// path at all, since "stuck" is the only case it exists for. Waiting on this
+	// channel from a separate goroutine works regardless.
+	evicted chan struct{}
+
 	hub    *Hub
 	roomID int64
 	c      chan []byte // the writable end of C
 	slow   atomic.Bool
 	once   sync.Once // close(c) exactly once, from either Close or broadcast
 }
+
+// Evicted is closed when the hub drops this subscription for being too slow.
+// The caller should tear down its socket when it fires — otherwise the client
+// stays connected, receives nothing, and is told nothing.
+func (s *Subscription) Evicted() <-chan struct{} { return s.evicted }
 
 // Slow reports whether this subscription ended because the reader could not keep
 // up, rather than because it was closed normally.
@@ -69,7 +86,19 @@ func (s *Subscription) Slow() bool { return s.slow.Load() }
 
 // room is one Redis subscription plus the set of local sockets sharing it.
 type room struct {
-	cancel  context.CancelFunc // stops the pump, which closes the Redis subscription
+	// ps is kept so teardown can CLOSE it directly.
+	//
+	// Cancelling the pump's context is not enough. ReceiveMessage blocks on a
+	// socket read, and cancelling a context does not interrupt a read already in
+	// flight — the goroutine stays parked until data arrives. The subscription
+	// then never closes, and when a later message finally wakes that orphaned
+	// pump it broadcasts into whatever room is in the map NOW, so every member
+	// receives two copies. Observed 2026-08-09 as duplicated messages in the UI
+	// with PUBSUB NUMSUB room:1 reporting 2 for a single gateway process.
+	//
+	// Closing the connection is what actually interrupts the read.
+	ps      *redis.PubSub
+	cancel  context.CancelFunc
 	members map[*Subscription]struct{}
 }
 
@@ -104,7 +133,7 @@ func New(rdb *redis.Client, buffer int) *Hub {
 // is the first member.
 func (h *Hub) Join(roomID int64) *Subscription {
 	ch := make(chan []byte, h.buf)
-	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID}
+	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID, evicted: make(chan struct{})}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -120,9 +149,9 @@ func (h *Hub) Join(roomID int64) *Subscription {
 		// leaves, and by nothing else.
 		ctx, cancel := context.WithCancel(context.Background())
 		ps := h.rdb.Subscribe(ctx, Channel(roomID))
-		r = &room{cancel: cancel, members: make(map[*Subscription]struct{})}
+		r = &room{ps: ps, cancel: cancel, members: make(map[*Subscription]struct{})}
 		h.rooms[roomID] = r
-		go h.pump(ctx, roomID, ps)
+		go h.pump(ctx, roomID, r)
 	}
 	r.members[s] = struct{}{}
 	return s
@@ -135,16 +164,18 @@ func (h *Hub) Join(roomID int64) *Subscription {
 // when that buffer fills — a drop policy nobody chose, buried in a library
 // default. ReceiveMessage blocks instead, so back-pressure surfaces here where
 // we can decide what to do about it.
-func (h *Hub) pump(ctx context.Context, roomID int64, ps *redis.PubSub) {
-	defer ps.Close()
+func (h *Hub) pump(ctx context.Context, roomID int64, r *room) {
+	defer r.ps.Close()
 	for {
-		msg, err := ps.ReceiveMessage(ctx)
+		msg, err := r.ps.ReceiveMessage(ctx)
 		if err != nil {
-			// Context cancelled (last member left), or Redis is unreachable and
+			// Subscription closed by teardown, or Redis is unreachable and
 			// go-redis has given up reconnecting.
 			return
 		}
-		h.broadcast(roomID, []byte(msg.Payload))
+		// Pass r, not just roomID: broadcast must be able to tell whether this
+		// pump still owns the room. See the identity check there.
+		h.broadcast(roomID, r, []byte(msg.Payload))
 	}
 }
 
@@ -153,14 +184,19 @@ func (h *Hub) pump(ctx context.Context, roomID int64, ps *redis.PubSub) {
 // The SAME byte slice goes to every member — a zero-copy fan-out. The contract
 // is that nobody mutates it, which holds because the only consumer marshals it
 // into a frame and writes it.
-func (h *Hub) broadcast(roomID int64, payload []byte) {
+func (h *Hub) broadcast(roomID int64, from *room, payload []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	r, ok := h.rooms[roomID]
-	if !ok {
+	// Belt and braces against the leak fixed above: a pump that outlived its own
+	// room instance must never deliver into the room that REPLACED it. Comparing
+	// pointers is enough — a rebuilt room is a different allocation — and it
+	// makes duplicate delivery impossible even if some future teardown path
+	// forgets to close the subscription.
+	if h.rooms[roomID] != from {
 		return
 	}
+	r := from
 
 	for s := range r.members {
 		select {
@@ -177,9 +213,16 @@ func (h *Hub) broadcast(roomID int64, payload []byte) {
 			// one slow socket freezing the room.
 			//
 			// Deleting from a map while ranging over it is well defined in Go.
+			// Logged HERE, at the moment of eviction, not where the socket finally
+			// unwinds. The handler's own log line runs in a defer, so it timestamps
+			// teardown rather than the decision — which made it impossible to tell
+			// "evicted late" apart from "evicted promptly, closed late".
+			log.Printf("hub: evicting slow reader from room %d (%d-message buffer full)",
+				roomID, cap(s.c))
 			s.slow.Store(true)
 			delete(r.members, s)
 			s.closeC()
+			close(s.evicted) // only reachable once: we just removed s from members
 		}
 	}
 }
@@ -200,8 +243,14 @@ func (s *Subscription) Close() {
 		s.closeC()
 	}
 	if len(r.members) == 0 {
-		// Last one out turns off the lights: cancelling the pump's context ends
-		// ReceiveMessage, which returns and closes the Redis subscription.
+		// Last one out turns off the lights.
+		//
+		// CLOSE the subscription, don't just cancel the context. The pump is
+		// blocked in ReceiveMessage on a socket read, and a cancelled context
+		// does not interrupt a read already in flight — closing the connection
+		// does. cancel() is still called so the context is not leaked, but it is
+		// the Close that actually stops the goroutine.
+		r.ps.Close()
 		r.cancel()
 		delete(h.rooms, s.roomID)
 	}
