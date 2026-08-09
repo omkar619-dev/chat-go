@@ -41,13 +41,27 @@ services:
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       # Two "call-back numbers": INTERNAL for clients inside the docker network
-      # (advertised as the service name `kafka`), EXTERNAL for host clients
-      # (advertised as localhost:9094). Each client gets the one it can reach.
+      # (advertised as the service name `kafka`), EXTERNAL for host clients.
+      # Each client gets the one it can reach.
+      #
+      # EXTERNAL advertises 127.0.0.1, NOT localhost. A Kafka client connects to
+      # the bootstrap address and is then TOLD where the broker really lives, so
+      # advertising "localhost" makes every client re-resolve it — and on Windows
+      # that resolves to ::1, where wslrelay.exe accepts connections it never
+      # forwards. Bootstrapping over IPv4 is pointless if the broker then
+      # redirects you to a broken IPv6 path.
       KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://127.0.0.1:9094
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # WITHOUT THIS THE VOLUME BELOW IS DECORATIVE. The apache/kafka image
+      # defaults log.dirs to /tmp/kafka-logs — inside the container's writable
+      # layer — so every `docker compose up` that RECREATES the container (any
+      # environment change does this) silently discards the entire message log
+      # and all consumer offsets. Cost the whole chat.messages topic once, on
+      # 2026-08-09, to an unrelated one-line config change.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1

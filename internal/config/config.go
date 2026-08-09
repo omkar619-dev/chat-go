@@ -28,11 +28,21 @@ type Config struct {
 // `go run` Just Works locally with no .env file needed.
 func Load() Config {
 	return Config{
-		HTTPAddr:    getenv("HTTP_ADDR", ":8090"), // :8080 is taken by the local Atlassian app
-		DatabaseURL: getenv("DATABASE_URL", "postgres://chat:chat_dev@localhost:5433/chat?sslmode=disable"),
-		RedisAddr:   getenv("REDIS_ADDR", "localhost:6381"),
+		HTTPAddr: getenv("HTTP_ADDR", ":8090"), // :8080 is taken by the local Atlassian app
+		// 127.0.0.1, NOT localhost, and deliberately so.
+		//
+		// Go resolves "localhost" to ::1 (IPv6) first. On Windows with Docker's WSL2
+		// backend, com.docker.backend binds the wildcard :: while wslrelay.exe binds
+		// the specific ::1 — and Windows routes to the most specific listener. So
+		// "localhost" reaches wslrelay, which ACCEPTS the TCP connection and then
+		// never forwards it. Every reachability check passes; every real connection
+		// hangs until its deadline. Cost half an evening to find, because a listener
+		// that accepts and does nothing is invisible to anything short of speaking
+		// the actual protocol. Pinning IPv4 sidesteps the whole race.
+		DatabaseURL: getenv("DATABASE_URL", "postgres://chat:chat_dev@127.0.0.1:5433/chat?sslmode=disable"),
+		RedisAddr:   getenv("REDIS_ADDR", "127.0.0.1:6381"),
 		JWTSecret:   getenv("JWT_SECRET", devJWTSecret),
-		KafkaBroker: getenv("KAFKA_BROKER", "localhost:9094"),
+		KafkaBroker: getenv("KAFKA_BROKER", "127.0.0.1:9094"), // IPv4 for the same reason as above
 		KafkaTopic:  getenv("KAFKA_TOPIC", "chat.messages"),
 		// Ollama runs on the homelab Old PC. This address is a DHCP lease that moved
 		// three times (192.168.1.105 → 192.168.0.232 → 192.168.29.123 → this one),
