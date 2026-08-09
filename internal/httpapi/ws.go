@@ -3,7 +3,6 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/omkar619-dev/chat-go/internal/auth"
 	"github.com/omkar619-dev/chat-go/internal/broker"
+	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
 )
 
@@ -55,11 +55,29 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 
 	ctx := r.Context()
-	channel := fmt.Sprintf("room:%d", roomID)
+	channel := hub.Channel(roomID)
+
+	// 4. Join the room. The hub holds ONE Redis subscription per room for this
+	//    process and fans each message out to that room's local sockets, so a
+	//    thousand users in a room cost Redis one subscription rather than a
+	//    thousand. See internal/hub for the measurements that motivated it.
+	//
+	//    Registered BEFORE the watermark defer so the defer can close over `sub`
+	//    and ask whether we were evicted. Defers run last-in-first-out, so the
+	//    watermark still runs before Close.
+	sub := h.Hub.Join(roomID)
+	defer sub.Close()
 
 	// Advance this user's read watermark when the socket closes. "Connected" is
 	// our proxy for "present": anything delivered while you were here counts as
 	// seen, so the gap /catchup summarises is exactly the time you were away.
+	//
+	// UNLESS the hub evicted us for being too slow. That happens precisely when
+	// messages were still queued and undelivered, so writing "read up to now"
+	// would mark as read the exact messages the user was disconnected for
+	// missing — and /catchup would then refuse to mention them. Skipping the
+	// write leaves the watermark where it was: /catchup covers more than
+	// strictly necessary, which is the safe direction to be wrong in.
 	//
 	// NOTE the context. ctx is r.Context(), which is ALREADY CANCELLED by the time
 	// this defer runs — the connection closing is what cancelled it. A query on a
@@ -67,6 +85,11 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	// give it its own short deadline. Deferred cleanup can almost never reuse the
 	// request context, and the failure is silent if you don't think about it.
 	defer func() {
+		if sub.Slow() {
+			log.Printf("evicted slow reader (room %d, user %d) — watermark left unchanged",
+				roomID, claims.UserID)
+			return
+		}
 		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := h.Queries.UpsertRoomRead(saveCtx, sqlc.UpsertRoomReadParams{
@@ -78,16 +101,16 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 4. Subscribe to the room's channel — anything published there (by anyone,
-	//    on any gateway) should be delivered down THIS socket.
-	sub := h.Redis.Subscribe(ctx, channel)
-	defer sub.Close()
-
-	// 5. Replay history. This happens AFTER subscribing on purpose: anything
-	//    published while we're loading is buffered by the subscription rather
-	//    than missed. The cost is a possible duplicate of the newest message;
+	// 5. Replay history. This happens AFTER joining on purpose: anything published
+	//    while we're loading queues in this subscription's buffer rather than
+	//    being missed. The cost is a possible duplicate of the newest message;
 	//    the alternative ordering would leave a permanent GAP. A duplicate is
 	//    recoverable, a gap is not.
+	//
+	//    That buffer is now finite (HUB_BUFFER, default 64). A room busy enough to
+	//    produce 64 messages during one replay would evict the joiner before they
+	//    finished arriving — worth knowing, and worth watching for in the logs
+	//    rather than assuming it cannot happen.
 	history, err := h.Queries.ListRecentMessages(ctx, roomID)
 	if err != nil {
 		log.Printf("history (room %d): %v", roomID, err)
@@ -108,10 +131,14 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 6. Pump A: Redis channel -> this socket, in its own goroutine.
+	// 6. Pump A: hub -> this socket, in its own goroutine.
+	//
+	//    sub.C is closed when the subscription ends — either we called Close, or
+	//    the hub evicted us — so ranging over it terminates on its own and needs
+	//    no separate done signal.
 	go func() {
-		for msg := range sub.Channel() {
-			if err := writeFrame(ctx, conn, messageFrame([]byte(msg.Payload))); err != nil {
+		for payload := range sub.C {
+			if err := writeFrame(ctx, conn, messageFrame(payload)); err != nil {
 				return
 			}
 		}

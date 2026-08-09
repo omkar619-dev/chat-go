@@ -12,6 +12,7 @@ import (
 	"github.com/omkar619-dev/chat-go/internal/auth"
 	"github.com/omkar619-dev/chat-go/internal/broker"
 	"github.com/omkar619-dev/chat-go/internal/embed"
+	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/llm"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
 )
@@ -20,7 +21,10 @@ import (
 type Handlers struct {
 	Queries   *sqlc.Queries
 	JWTSecret string
+	// Redis is still here for PUBLISH, which is an ordinary pooled command.
+	// SUBSCRIBE goes through Hub instead — see internal/hub.
 	Redis     *redis.Client
+	Hub       *hub.Hub // one Redis subscription per room, fanned out in-process
 	Producer  *broker.Producer
 	Embedder  *embed.Client // embeds search queries; only /search needs it
 	Generator *llm.Client   // streams "catch me up" summaries down the WebSocket

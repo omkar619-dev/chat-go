@@ -19,6 +19,7 @@ import (
 	"github.com/omkar619-dev/chat-go/internal/db"
 	"github.com/omkar619-dev/chat-go/internal/embed"
 	"github.com/omkar619-dev/chat-go/internal/httpapi"
+	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/llm"
 	"github.com/omkar619-dev/chat-go/internal/redisclient"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
@@ -80,6 +81,10 @@ func main() {
 		Queries:   queries,
 		JWTSecret: cfg.JWTSecret,
 		Redis:     rdb,
+		// One Redis subscription per ROOM for this process, rather than one per
+		// connection. Shares the same client: PUBLISH still uses the pool, only
+		// SUBSCRIBE moves behind the hub.
+		Hub:       hub.New(rdb, cfg.HubBuffer),
 		Producer:  producer,
 		Embedder:  embedder,
 		Generator: generator,

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 )
 
 // devJWTSecret is the placeholder that used to be a silent default. It stays
@@ -21,6 +22,7 @@ type Config struct {
 	OllamaURL   string // Ollama base URL (serves both embeddings and generation)
 	EmbedModel  string // embedding model name (must match the schema's vector size)
 	ChatModel   string // generation model name, used by the RAG bot
+	HubBuffer   int    // messages that may queue for one socket before the hub drops it
 }
 
 // Load reads config from environment variables, falling back to local-dev
@@ -61,7 +63,22 @@ func Load() Config {
 		// cheap — nothing stored depends on it (no vectors to re-compute), so it's
 		// safe to swap while hunting for one that's fast enough on the host.
 		ChatModel: getenv("CHAT_MODEL", "qwen2.5:1.5b"),
+		// How far one slow socket may fall behind before the hub disconnects it.
+		// Env-tunable on purpose: this is the first number in the system that
+		// should be chosen by MEASUREMENT rather than taste, and cmd/loadtest can
+		// now sweep it. Too small and ordinary network hiccups evict people; too
+		// large and a stalled socket holds memory for messages it will never read.
+		HubBuffer: getenvInt("HUB_BUFFER", 64),
 	}
+}
+
+// getenvInt is getenv for integers, falling back on anything unparseable rather
+// than failing to boot over a typo in a tuning knob.
+func getenvInt(key string, fallback int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
+		return v
+	}
+	return fallback
 }
 
 // RequireJWTSecret refuses to accept a missing or placeholder signing key.

@@ -1,0 +1,215 @@
+// Package hub keeps ONE Redis subscription per room per gateway process and fans
+// each message out to that room's local sockets.
+//
+// Before this existed, internal/httpapi/ws.go called Redis Subscribe inside the
+// per-connection handler. A subscribed Redis connection cannot be pooled — once
+// it issues SUBSCRIBE it can no longer serve ordinary commands — so every
+// WebSocket cost a dedicated Redis connection AND received its own copy of every
+// message. Measured 2026-08-09:
+//
+//	500 sockets -> connected_clients went 2 -> 502 -> 2   (exactly 1:1)
+//	a 40-byte message cost 172 bytes per subscriber out of Redis, flat across
+//	50 / 100 / 250 / 500 subscribers, so the total is linear in subscriber count
+//
+// At 10,000 users in one room that is 1.72 MB of Redis egress for a single
+// 40-byte message, and ~9,998 users exhausts Redis's default maxclients of
+// 10,000 with no messages flowing at all. maxclients is server-wide, so adding
+// gateways shares that budget rather than expanding it.
+//
+// With one subscription per room per process, the same message costs 172 bytes
+// times the number of gateway PROCESSES — independent of how many users are
+// connected.
+//
+// This package deliberately knows nothing about WebSockets. It deals in payload
+// bytes and channels; the caller owns the socket. That keeps the concurrency
+// logic testable on its own, which matters because it is the hardest code here.
+package hub
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/redis/go-redis/v9"
+)
+
+// Channel is the Redis pub/sub channel name for a room.
+//
+// Exported so the PUBLISH side uses the same string as the SUBSCRIBE side. A
+// mismatch here delivers nothing at all and presents as a silently broken
+// socket, which is a miserable thing to debug.
+func Channel(roomID int64) string { return fmt.Sprintf("room:%d", roomID) }
+
+// Subscription is one socket's view of a room. The caller ranges over C and
+// writes whatever arrives to its WebSocket.
+type Subscription struct {
+	// C delivers messages published to this room. It is CLOSED when the
+	// subscription ends — either because the caller called Close, or because the
+	// caller was too slow and the hub dropped it. Ranging over it therefore ends
+	// on its own; the caller does not need a separate done signal.
+	C <-chan []byte
+
+	hub    *Hub
+	roomID int64
+	c      chan []byte // the writable end of C
+	slow   atomic.Bool
+	once   sync.Once // close(c) exactly once, from either Close or broadcast
+}
+
+// Slow reports whether this subscription ended because the reader could not keep
+// up, rather than because it was closed normally.
+//
+// The caller needs this to decide whether advancing the read watermark would be
+// a LIE. A forced disconnect happens precisely when messages were still sitting
+// in the buffer undelivered — writing "read up to now" would then mark unread
+// the exact messages the user was disconnected for missing, and /catchup would
+// refuse to mention them.
+func (s *Subscription) Slow() bool { return s.slow.Load() }
+
+// room is one Redis subscription plus the set of local sockets sharing it.
+type room struct {
+	cancel  context.CancelFunc // stops the pump, which closes the Redis subscription
+	members map[*Subscription]struct{}
+}
+
+// Hub owns every room's subscription for this process.
+type Hub struct {
+	rdb *redis.Client
+	buf int // per-subscriber buffer depth
+
+	// One mutex guards both the room map and every room's member set.
+	//
+	// Coarse on purpose. The only work done while holding it is a map lookup and
+	// one NON-BLOCKING channel send per member, which is nanoseconds each — a
+	// 10,000-member fan-out is tens of microseconds. A per-room lock would remove
+	// cross-room contention but needs two-level locking against the map, and that
+	// is a deadlock waiting to happen. If contention ever shows up in a profile
+	// it is worth doing; guessing at it now is not.
+	mu    sync.Mutex
+	rooms map[int64]*room
+}
+
+// New builds a Hub. buffer is how many messages may queue for one socket before
+// the hub gives up on it; 64 is a reasonable starting point and is now a number
+// that can be MEASURED with cmd/loadtest rather than guessed at.
+func New(rdb *redis.Client, buffer int) *Hub {
+	if buffer <= 0 {
+		buffer = 64
+	}
+	return &Hub{rdb: rdb, buf: buffer, rooms: make(map[int64]*room)}
+}
+
+// Join adds a socket to a room, creating the room's Redis subscription if this
+// is the first member.
+func (h *Hub) Join(roomID int64) *Subscription {
+	ch := make(chan []byte, h.buf)
+	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	r, ok := h.rooms[roomID]
+	if !ok {
+		// First member in: create the ONE subscription for this room.
+		//
+		// context.Background(), NOT the joiner's request context. The subscription
+		// belongs to the ROOM, not to whoever happened to arrive first — tying it
+		// to their request would kill the entire room's feed the moment that one
+		// user closed their tab. It is cancelled by Close when the last member
+		// leaves, and by nothing else.
+		ctx, cancel := context.WithCancel(context.Background())
+		ps := h.rdb.Subscribe(ctx, Channel(roomID))
+		r = &room{cancel: cancel, members: make(map[*Subscription]struct{})}
+		h.rooms[roomID] = r
+		go h.pump(ctx, roomID, ps)
+	}
+	r.members[s] = struct{}{}
+	return s
+}
+
+// pump is the single reader of one room's Redis subscription.
+//
+// Uses ReceiveMessage rather than PubSub.Channel(). Channel() spawns its own
+// goroutine with an internal buffer (100 by default) and SILENTLY DROPS messages
+// when that buffer fills — a drop policy nobody chose, buried in a library
+// default. ReceiveMessage blocks instead, so back-pressure surfaces here where
+// we can decide what to do about it.
+func (h *Hub) pump(ctx context.Context, roomID int64, ps *redis.PubSub) {
+	defer ps.Close()
+	for {
+		msg, err := ps.ReceiveMessage(ctx)
+		if err != nil {
+			// Context cancelled (last member left), or Redis is unreachable and
+			// go-redis has given up reconnecting.
+			return
+		}
+		h.broadcast(roomID, []byte(msg.Payload))
+	}
+}
+
+// broadcast delivers one payload to every local member of a room.
+//
+// The SAME byte slice goes to every member — a zero-copy fan-out. The contract
+// is that nobody mutates it, which holds because the only consumer marshals it
+// into a frame and writes it.
+func (h *Hub) broadcast(roomID int64, payload []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	r, ok := h.rooms[roomID]
+	if !ok {
+		return
+	}
+
+	for s := range r.members {
+		select {
+		case s.c <- payload:
+			// Queued for this socket's writer.
+		default:
+			// Buffer full: this reader cannot keep up.
+			//
+			// DISCONNECT rather than drop. Dropping leaves holes in their
+			// conversation with no signal that anything went wrong — silent loss
+			// behind a healthy-looking UI. Disconnecting is recoverable: they
+			// reconnect and history replays from Postgres, so they lose nothing.
+			// Blocking is not an option at all; that is head-of-line blocking,
+			// one slow socket freezing the room.
+			//
+			// Deleting from a map while ranging over it is well defined in Go.
+			s.slow.Store(true)
+			delete(r.members, s)
+			s.closeC()
+		}
+	}
+}
+
+// Close removes this socket from its room, tearing the room down if it was the
+// last member. Safe to call more than once.
+func (s *Subscription) Close() {
+	h := s.hub
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	r, ok := h.rooms[s.roomID]
+	if !ok {
+		return // room already gone; broadcast dropped us and we were the last
+	}
+	if _, member := r.members[s]; member {
+		delete(r.members, s)
+		s.closeC()
+	}
+	if len(r.members) == 0 {
+		// Last one out turns off the lights: cancelling the pump's context ends
+		// ReceiveMessage, which returns and closes the Redis subscription.
+		r.cancel()
+		delete(h.rooms, s.roomID)
+	}
+}
+
+// closeC closes the delivery channel exactly once. Both Close and broadcast can
+// reach it — a socket can be dropped for slowness at the same moment its handler
+// is unwinding — and closing a closed channel panics.
+func (s *Subscription) closeC() {
+	s.once.Do(func() { close(s.c) })
+}
