@@ -8,7 +8,7 @@ Each item states the shortcut, why it is dangerous, and the intended fix. Items 
 found while building, not bolted on afterwards — the decision each time was to note it
 and keep feature work moving, rather than half-fix it under time pressure.
 
-Status: **none started** — Phases 1 and 2 are complete; hardening runs before Phase 8 (deploy).
+Status: **1 of 5 blockers closed** (B3, 2026-08-09). The rest run before Phase 8 (deploy).
 
 ---
 
@@ -50,16 +50,33 @@ match the `Host` header, which is exactly right for a same-origin deployment. If
 end is ever served from a different host, use `OriginPatterns` with an explicit allowlist —
 never a wildcard.
 
-### B3. The JWT signing secret has a working default
-`internal/config/config.go` falls back to `JWTSecret: "dev-change-me"`.
+### ~~B3. The JWT signing secret has a working default~~ — ✅ FIXED 2026-08-09
+`internal/config/config.go` fell back to `JWTSecret: "dev-change-me"`.
 
-**Why it's dangerous:** it fails *open*. Forget to set `JWT_SECRET` in production and the
-service starts happily, signing tokens with a secret that is published in this repo.
-Anyone can then forge a token for any user.
+**Why it was dangerous:** it failed *open*, and did so **invisibly**. With `JWT_SECRET`
+unset, every instance fell back to the *same* placeholder — so logins succeeded, tokens
+minted on one gateway validated on another, and nothing anywhere errored, while a string
+published in this repo signed every token in the system. That is worse than a mismatch: a
+mismatch produces random 401s and gets investigated in minutes, whereas a consistent wrong
+default produces a service that behaves perfectly and is wide open.
 
-**Fix:** keep the default for local dev only, gated on an explicit environment marker
-(`APP_ENV=production` → refuse to start unless `JWT_SECRET` is set and is not the dev
-value). Fail *closed*, loudly, at boot — not silently at runtime.
+**Fixed by** `config.RequireJWTSecret()`, called from `cmd/gateway/main.go` before any
+connection is dialled. The placeholder is a named constant so it can be refused *by name*:
+unset and explicitly-set-to-the-placeholder are the same mistake and fail the same way.
+
+Deliberately stricter than the fix originally proposed here. The plan was to gate on an
+`APP_ENV=production` marker and keep the default for local dev; the implementation has **no
+escape hatch at all**, because an escape hatch is exactly the thing that ends up enabled in
+production. Local dev sets a real random secret once, in the user environment.
+
+Only the gateway signs or verifies tokens, so the check lives there rather than in `Load()`.
+The persister, indexer and bot need no secret and are unaffected — requiring it everywhere
+would be theatre with a real cost.
+
+Surfaced by Phase 6.1: with two gateways behind nginx, a token is minted on whichever
+instance served `POST /login` and verified on whichever served `GET /ws`. That works only
+while every instance holds the same key — the property a Kubernetes Secret must guarantee
+across replicas (see B5), and precisely the one the old default hid.
 
 ### B4. No TLS
 Everything is `http://` and `ws://`.

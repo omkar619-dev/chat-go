@@ -19,12 +19,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -35,6 +37,9 @@ func main() {
 	room := flag.Int64("room", 1, "room to join")
 	ramp := flag.Duration("ramp", 5*time.Millisecond, "pause between dials")
 	hold := flag.Duration("hold", 30*time.Second, "how long to hold the connections open")
+	publish := flag.Int("publish", 0, "messages to publish once connections settle (0 = skip the fan-out measurement)")
+	rate := flag.Int("rate", 10, "messages per second while publishing")
+	redisAddr := flag.String("redis", "127.0.0.1:6381", "redis address, read-only, for INFO sampling")
 	flag.Parse()
 
 	// Ctrl+C cancels everything at once: the dial loop, every read loop, the hold.
@@ -120,6 +125,14 @@ func main() {
 	}
 
 	rampTook := time.Since(started)
+
+	// The fan-out measurement. Runs while every subscriber is still connected,
+	// then releases the hold so the read loops exit and wg.Wait() returns.
+	if *publish > 0 {
+		publishPhase(holdCtx, wsURL, *redisAddr, *publish, *rate, int(int64(*conns)-failed.Load()), &frames)
+		cancelHold()
+	}
+
 	wg.Wait()
 
 	established := int64(*conns) - failed.Load()
@@ -129,6 +142,141 @@ func main() {
 	log.Printf("dial failed:  %d", failed.Load())
 	log.Printf("ramp took:    %s", rampTook.Round(time.Millisecond))
 	log.Printf("frames recvd: %d  (~%d per connection)", frames.Load(), safeDiv(frames.Load(), established))
+}
+
+// publishPhase measures what a single PUBLISH actually costs Redis.
+//
+// The subscribers are already connected and idle. We snapshot Redis's own byte
+// counters, send `count` messages down ONE extra connection, wait for delivery
+// to stop, and snapshot again.
+//
+// The number that matters is bytes-out per published message:
+//
+//	one subscription per GATEWAY    -> roughly one message, flat as subscribers grow
+//	one subscription per CONNECTION -> one message × subscribers, linear
+//
+// Reading Redis's counters rather than timing anything is deliberate. A ratio is
+// immune to how loaded the machine is — a contended CPU slows everything
+// uniformly, it does not turn 500 deliveries into 250 — which is what makes this
+// measurement trustworthy on a laptop that is also running the client.
+func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, subs int, frames *atomic.Int64) {
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer rdb.Close()
+
+	// Let history replay finish first. Every connection is handed ~50 messages
+	// from Postgres on connect, and attributing those to the publish would
+	// inflate the result by a factor of fifty.
+	waitQuiet(ctx, frames, 3*time.Second)
+
+	before, err := redisCounters(ctx, rdb)
+	if err != nil {
+		log.Printf("redis INFO: %v", err)
+		return
+	}
+	baseFrames := frames.Load()
+
+	pub, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		log.Printf("publisher dial: %v", err)
+		return
+	}
+	defer pub.CloseNow()
+
+	// The publisher is itself a member of the room, so the server pushes every
+	// message back to it. Nothing reads that socket otherwise, and an unread
+	// socket eventually stalls the writer — so drain and discard.
+	go func() {
+		for {
+			if _, _, err := pub.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Fixed-size body so bytes-per-message is comparable across runs.
+	body := strings.Repeat("x", 40)
+	interval := time.Second / time.Duration(rate)
+	log.Printf("publishing %d messages at %d/s to %d subscribers", count, rate, subs)
+
+	sent := 0
+	for i := 0; i < count; i++ {
+		if err := pub.Write(ctx, websocket.MessageText, []byte(body)); err != nil {
+			log.Printf("publish %d: %v", i, err)
+			break
+		}
+		sent++
+		time.Sleep(interval)
+	}
+	if sent == 0 {
+		return
+	}
+
+	waitQuiet(ctx, frames, 3*time.Second)
+
+	after, err := redisCounters(ctx, rdb)
+	if err != nil {
+		log.Printf("redis INFO: %v", err)
+		return
+	}
+
+	outDelta := after.outBytes - before.outBytes
+	cmdDelta := after.commands - before.commands
+	delivered := frames.Load() - baseFrames
+
+	log.Printf("─── fan-out ─────────────")
+	log.Printf("subscribers:          %d", subs)
+	log.Printf("messages published:   %d", sent)
+	log.Printf("frames delivered:     %d  (expected %d)", delivered, int64(sent)*int64(subs))
+	log.Printf("redis commands:       %d", cmdDelta)
+	log.Printf("redis bytes out:      %d", outDelta)
+	log.Printf("bytes per message:    %d", outDelta/int64(sent))
+	log.Printf("  ... per subscriber: %d   <-- roughly CONSTANT across N means bytes scale WITH N",
+		outDelta/int64(sent)/int64(max(subs, 1)))
+}
+
+// waitQuiet blocks until the frame counter stops moving for `quiet`. Without it
+// one phase drains into the next and the measurement includes work it did not do.
+func waitQuiet(ctx context.Context, frames *atomic.Int64, quiet time.Duration) {
+	last := frames.Load()
+	stable := time.Now()
+	for ctx.Err() == nil {
+		time.Sleep(250 * time.Millisecond)
+		if n := frames.Load(); n != last {
+			last, stable = n, time.Now()
+			continue
+		}
+		if time.Since(stable) >= quiet {
+			return
+		}
+	}
+}
+
+type counters struct {
+	outBytes int64
+	commands int64
+}
+
+// redisCounters reads the two cumulative counters we diff around the publish.
+func redisCounters(ctx context.Context, rdb *redis.Client) (counters, error) {
+	info, err := rdb.Info(ctx, "stats").Result()
+	if err != nil {
+		return counters{}, err
+	}
+	return counters{
+		outBytes: infoInt(info, "total_net_output_bytes"),
+		commands: infoInt(info, "total_commands_processed"),
+	}, nil
+}
+
+// infoInt pulls one "key:value" line out of an INFO section.
+func infoInt(info, key string) int64 {
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), key+":"); ok {
+			n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return n
+		}
+	}
+	return 0
 }
 
 // progress prints a live count every two seconds. Without it a long run is
