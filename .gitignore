@@ -5,6 +5,7 @@
 # build artifacts
 /bin/
 *.exe
+*.exe~
 *.test
 *.out
 
