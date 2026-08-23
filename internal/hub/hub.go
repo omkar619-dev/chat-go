@@ -64,6 +64,7 @@ type Subscription struct {
 
 	hub    *Hub
 	roomID int64
+	userID int64       // carried only so presence can report who is here
 	c      chan []byte // the writable end of C
 	slow   atomic.Bool
 	once   sync.Once // close(c) exactly once, from either Close or broadcast
@@ -131,9 +132,13 @@ func New(rdb *redis.Client, buffer int) *Hub {
 
 // Join adds a socket to a room, creating the room's Redis subscription if this
 // is the first member.
-func (h *Hub) Join(roomID int64) *Subscription {
+//
+// userID is not used for delivery — the hub fans out to sockets, not to people —
+// but presence needs to answer "who is here", and the hub is the only thing that
+// knows. One user may hold several subscriptions (two tabs, phone and laptop).
+func (h *Hub) Join(roomID, userID int64) *Subscription {
 	ch := make(chan []byte, h.buf)
-	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID, evicted: make(chan struct{})}
+	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID, userID: userID, evicted: make(chan struct{})}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -225,6 +230,43 @@ func (h *Hub) broadcast(roomID int64, from *room, payload []byte) {
 			close(s.evicted) // only reachable once: we just removed s from members
 		}
 	}
+}
+
+// RoomMembers is a snapshot of who this process has connected to one room.
+type RoomMembers struct {
+	RoomID int64
+	// UserIDs is DEDUPLICATED — one entry per person, not per socket. Someone
+	// with a phone and a laptop open is present once, which is what presence
+	// means and what keeps the ZADD small.
+	UserIDs []int64
+}
+
+// Rooms snapshots every room this process currently holds members for.
+//
+// Returns a COPY, and the lock is released before the caller does anything with
+// it. That matters: the caller is the presence heartbeat, which follows this
+// with network calls to Redis. Holding the hub's mutex across a round trip would
+// stall message delivery in EVERY room behind it — the mutex is only cheap
+// because nothing slow ever happens under it. Copy, unlock, then do the slow
+// thing.
+func (h *Hub) Rooms() []RoomMembers {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	out := make([]RoomMembers, 0, len(h.rooms))
+	for roomID, r := range h.rooms {
+		seen := make(map[int64]struct{}, len(r.members))
+		ids := make([]int64, 0, len(r.members))
+		for s := range r.members {
+			if _, dup := seen[s.userID]; dup {
+				continue
+			}
+			seen[s.userID] = struct{}{}
+			ids = append(ids, s.userID)
+		}
+		out = append(out, RoomMembers{RoomID: roomID, UserIDs: ids})
+	}
+	return out
 }
 
 // Close removes this socket from its room, tearing the room down if it was the

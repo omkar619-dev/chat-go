@@ -65,7 +65,7 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	//    Registered BEFORE the watermark defer so the defer can close over `sub`
 	//    and ask whether we were evicted. Defers run last-in-first-out, so the
 	//    watermark still runs before Close.
-	sub := h.Hub.Join(roomID)
+	sub := h.Hub.Join(roomID, claims.UserID)
 	defer sub.Close()
 
 	// Advance this user's read watermark when the socket closes. "Connected" is

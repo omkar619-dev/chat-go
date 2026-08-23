@@ -21,6 +21,7 @@ import (
 	"github.com/omkar619-dev/chat-go/internal/httpapi"
 	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/llm"
+	"github.com/omkar619-dev/chat-go/internal/presence"
 	"github.com/omkar619-dev/chat-go/internal/redisclient"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
 )
@@ -77,6 +78,15 @@ func main() {
 	// in its own process; these two never share state.
 	generator := llm.New(cfg.OllamaURL, cfg.ChatModel)
 
+	// The hub is in its own variable because two things need it: the WebSocket
+	// handler (to join rooms) and the presence tracker (to ask who is connected).
+	roomHub := hub.New(rdb, cfg.HubBuffer)
+
+	// Presence: every 15 seconds, write this gateway's connected users into Redis
+	// so the OTHER gateways can see them too. Takes the root context, so Ctrl+C
+	// stops it along with everything else.
+	go presence.New(rdb, roomHub).Run(ctx)
+
 	h := &httpapi.Handlers{
 		Queries:   queries,
 		JWTSecret: cfg.JWTSecret,
@@ -84,7 +94,7 @@ func main() {
 		// One Redis subscription per ROOM for this process, rather than one per
 		// connection. Shares the same client: PUBLISH still uses the pool, only
 		// SUBSCRIBE moves behind the hub.
-		Hub:       hub.New(rdb, cfg.HubBuffer),
+		Hub:       roomHub,
 		Producer:  producer,
 		Embedder:  embedder,
 		Generator: generator,

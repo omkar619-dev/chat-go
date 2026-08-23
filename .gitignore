@@ -9,10 +9,11 @@
 *.test
 *.out
 
-# OS / editor noise
+# OS / editor / tool noise
 .DS_Store
 .idea/
 .vscode/
+.playwright-mcp/
 bob.json
 body.json
 room.json
