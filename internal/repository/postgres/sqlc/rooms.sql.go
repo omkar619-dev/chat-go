@@ -96,3 +96,50 @@ func (q *Queries) ListRooms(ctx context.Context) ([]Room, error) {
 	}
 	return items, nil
 }
+
+const listRoomsForUser = `-- name: ListRoomsForUser :many
+SELECT r.id, r.name, (rm.user_id IS NOT NULL)::boolean AS is_member
+FROM rooms r
+LEFT JOIN room_members rm ON rm.room_id = r.id AND rm.user_id = $1
+ORDER BY r.name
+`
+
+type ListRoomsForUserRow struct {
+	ID       int64  `json:"id"`
+	Name     string `json:"name"`
+	IsMember bool   `json:"is_member"`
+}
+
+// Every room, plus whether THIS user is already a member of it.
+//
+// One query rather than "list the rooms" followed by a membership check per
+// room: that version costs one database round trip per room, so the list gets
+// slower the more rooms exist.
+//
+// LEFT JOIN, not JOIN. A LEFT JOIN keeps rooms that have no matching membership
+// row, filling the joined columns with NULL — which is exactly how a room you
+// are NOT in still appears in the list as something you could join. A plain JOIN
+// would silently drop every room you haven't joined, which is most of them.
+// The ::boolean cast is not decoration. sqlc infers Go types from what Postgres
+// reports, and it cannot work out the type of a bare IS NOT NULL expression, so
+// it falls back to interface{} and the Go code then won't compile. The cast
+// tells it. Same trick as ::vector in search.sql.
+func (q *Queries) ListRoomsForUser(ctx context.Context, userID int64) ([]ListRoomsForUserRow, error) {
+	rows, err := q.db.Query(ctx, listRoomsForUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRoomsForUserRow{}
+	for rows.Next() {
+		var i ListRoomsForUserRow
+		if err := rows.Scan(&i.ID, &i.Name, &i.IsMember); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

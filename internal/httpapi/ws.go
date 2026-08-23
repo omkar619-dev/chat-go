@@ -15,6 +15,7 @@ import (
 	"github.com/omkar619-dev/chat-go/internal/auth"
 	"github.com/omkar619-dev/chat-go/internal/broker"
 	"github.com/omkar619-dev/chat-go/internal/hub"
+	"github.com/omkar619-dev/chat-go/internal/presence"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
 )
 
@@ -66,7 +67,37 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	//    and ask whether we were evicted. Defers run last-in-first-out, so the
 	//    watermark still runs before Close.
 	sub := h.Hub.Join(roomID, claims.UserID)
+
+	// Presence teardown. Registered FIRST so it runs LAST — after sub.Close()
+	// below has removed this socket from the hub. Without that ordering, HasUser
+	// would still see this very socket and always answer "yes", so nobody would
+	// ever be marked offline.
+	defer func() {
+		// ctx is already cancelled here; detach, same as the watermark write.
+		leaveCtx := context.WithoutCancel(ctx)
+
+		// Only mark them gone if this was their LAST socket on this gateway —
+		// closing one tab must not sign you out of the other.
+		if !h.Hub.HasUser(roomID, claims.UserID) {
+			if err := presence.MarkOffline(leaveCtx, h.Redis, roomID, claims.UserID); err != nil {
+				log.Printf("presence offline (room %d, user %d): %v", roomID, claims.UserID, err)
+			}
+		}
+		h.announcePresence(leaveCtx, roomID)
+	}()
+
 	defer sub.Close()
+
+	// Mark this person online straight away and tell the room to re-read the list.
+	//
+	// The write has to happen BEFORE the announcement. The heartbeat only runs
+	// every 15 seconds, so without this the nudge would arrive ahead of the data
+	// it is telling clients to go and fetch — and they would read a list that
+	// still doesn't contain the person who just arrived.
+	if err := presence.MarkOnline(ctx, h.Redis, roomID, claims.UserID); err != nil {
+		log.Printf("presence online (room %d, user %d): %v", roomID, claims.UserID, err)
+	}
+	h.announcePresence(ctx, roomID)
 
 	// Advance this user's read watermark when the socket closes. "Connected" is
 	// our proxy for "present": anything delivered while you were here counts as
@@ -137,8 +168,17 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	//    the hub evicted us — so ranging over it terminates on its own and needs
 	//    no separate done signal.
 	go func() {
-		for payload := range sub.C {
-			if err := writeFrame(ctx, conn, messageFrame(payload)); err != nil {
+		for ev := range sub.C {
+			var f frame
+			switch ev.Kind {
+			case hub.KindMessage:
+				f = messageFrame(ev.Payload)
+			case hub.KindPresence:
+				f = frame{Type: framePresence}
+			default:
+				continue // a kind this build doesn't know; ignore rather than guess
+			}
+			if err := writeFrame(ctx, conn, f); err != nil {
 				return
 			}
 		}

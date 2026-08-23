@@ -40,6 +40,39 @@ const (
 // Key is the Redis key holding one room's online list.
 func Key(roomID int64) string { return fmt.Sprintf("presence:room:%d", roomID) }
 
+// MarkOnline records one person as here, right now.
+//
+// Needed because the heartbeat only runs every 15 seconds. Without this, someone
+// who just connected would not appear in the list until the next tick — so the
+// "somebody joined" nudge would arrive BEFORE the data it is telling clients to
+// go and read, and they would fetch a list that still doesn't include the new
+// person.
+func MarkOnline(ctx context.Context, rdb *redis.Client, roomID, userID int64) error {
+	key := Key(roomID)
+	pipe := rdb.Pipeline()
+	pipe.ZAdd(ctx, key, redis.Z{Score: float64(time.Now().Unix()), Member: userID})
+	pipe.Expire(ctx, key, stale*2)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// MarkOffline removes one person immediately, instead of waiting for their entry
+// to go stale.
+//
+// Only correct to call once nobody on THIS gateway holds a socket for that user
+// any more — see hub.HasUser.
+//
+// Known wrinkle, accepted deliberately: if the same person is also connected via
+// the OTHER gateway, this removes them and that gateway's next heartbeat (within
+// 15s) puts them back, so they blink offline briefly. The alternative is to not
+// remove at all and let everyone linger for the full 45-second staleness window,
+// which makes closing a tab look broken. The flicker needs one person on two
+// different gateway processes at once, and it heals itself; the delay would hit
+// every single disconnect.
+func MarkOffline(ctx context.Context, rdb *redis.Client, roomID, userID int64) error {
+	return rdb.ZRem(ctx, Key(roomID), userID).Err()
+}
+
 // Online returns the user ids seen in this room recently enough to count.
 //
 // This read is the whole reason for storing presence as a sorted set scored by

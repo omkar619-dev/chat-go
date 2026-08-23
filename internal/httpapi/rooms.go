@@ -17,10 +17,9 @@ import (
 type roomResponse struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
-}
-
-func toRoomResponse(r sqlc.Room) roomResponse {
-	return roomResponse{ID: r.ID, Name: r.Name}
+	// Member lets the UI show "switch to" for rooms you're in and "join" for the
+	// rest, without asking the server about each room separately.
+	Member bool `json:"member"`
 }
 
 // CreateRoom creates a room and auto-joins the creator as a member.
@@ -57,12 +56,20 @@ func (h *Handlers) CreateRoom(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toRoomResponse(room))
+	// Member is true because the block above just added the creator.
+	writeJSON(w, http.StatusCreated, roomResponse{ID: room.ID, Name: room.Name, Member: true})
 }
 
-// ListRooms returns every room, so a user can see what to join.
+// ListRooms returns every room, flagging the ones this user is already in.
+//
+// Every room, not just yours: rooms are discoverable, which is how you find one
+// to join in the first place. Note that this makes every room joinable by any
+// account — tracked as I4 in docs/HARDENING.md, and the fix there is a
+// public/private flag rather than hiding the list.
 func (h *Handlers) ListRooms(w http.ResponseWriter, r *http.Request) {
-	rooms, err := h.Queries.ListRooms(r.Context())
+	userID, _ := UserIDFromContext(r.Context())
+
+	rooms, err := h.Queries.ListRoomsForUser(r.Context(), userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list rooms")
 		return
@@ -70,7 +77,7 @@ func (h *Handlers) ListRooms(w http.ResponseWriter, r *http.Request) {
 	// make(...,0,len) so an empty result marshals to [] not null.
 	out := make([]roomResponse, 0, len(rooms))
 	for _, room := range rooms {
-		out = append(out, toRoomResponse(room))
+		out = append(out, roomResponse{ID: room.ID, Name: room.Name, Member: room.IsMember})
 	}
 	writeJSON(w, http.StatusOK, out)
 }

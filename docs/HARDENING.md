@@ -123,6 +123,16 @@ working for the rest of its 24 hours.
 **Fix:** shorten the access-token lifetime to minutes, add a refresh endpoint, and keep a
 Redis denylist of revoked token ids (`jti`) for the remainder of their validity.
 
+**Chosen as the priority for auth work (2026-08-23), in preference to adding social login.**
+"Sign in with Google" was considered and deliberately skipped: it is a well-documented
+integration that would add an external dependency to a project whose value is elsewhere,
+and it demonstrates nothing about design. This does. Revoking a *stateless* token across
+several gateways without a database read on every request is a real problem with real
+trade-offs — how short is short enough, where the denylist lives, what happens when that
+store is unreachable, and whether you fail open or closed. The sign-out button shipped
+before this is honest about being a convenience only: it forgets the token locally and the
+token itself stays valid until it expires.
+
 ### I3. No rate limiting
 `/login` accepts unlimited attempts (brute force), and an open socket can publish messages
 as fast as it can write (spam, and unbounded Kafka/Postgres growth).
@@ -189,6 +199,34 @@ Separately, `cmd/bot` excludes its own replies from retrieved context (to avoid
 grounding answers in its own output), but the `/search` API does **not** filter them.
 That may well be correct — a user might want to find something the bot said — but it
 should be a deliberate decision, not an accident of where the filter happens to live.
+
+### H5. Nothing notices when a consumer stops
+Found the hard way on 2026-08-10. The persister was not running for several hours. Nothing
+reported it — not the gateway, not the browser, no error frame anywhere.
+
+**Why it was invisible:** the gateway's promise is that a message reached **Kafka**, and it
+kept that promise perfectly. Whether anything *consumed* that message is a separate
+guarantee, and nothing in the system was watching it. "Durably recorded" and "processed into
+a queryable table" are two different claims, and a dead consumer breaks the second while the
+first stays true.
+
+**How it eventually surfaced:** as an unrelated-looking symptom, hours later — "my messages
+disappear when I switch rooms". History replay reads Postgres, Postgres is filled by the
+persister, so an idle persister looks exactly like lost messages from the UI. The data was
+never lost; it was still sitting in Kafka and drained the moment the persister restarted,
+which is the at-least-once design working as intended.
+
+**Fix:** export **consumer lag** — the gap between the newest offset in a partition and the
+last offset a group has committed — for all three groups (`persister`, `indexer`, `bot`), and
+alert on it growing. Lag is the right signal precisely because it catches *both* failure
+modes with one number: a consumer that has died, and one that is merely too slow. Natural
+fit alongside Phase 8, since the homelab already runs Prometheus.
+
+Related: the persister deliberately retries in place and never advances past a failed message
+(see the offset-commit note in the Phase 2 history), which means a poison message stops that
+partition rather than skipping it. That is the correct trade for not losing data, but it makes
+lag monitoring more important, not less — a stuck consumer and a dead one look identical from
+the outside.
 
 ### H4. Single points of failure
 Single-node Kafka (`replication factor 1`), single Postgres, single Redis. Acceptable for a

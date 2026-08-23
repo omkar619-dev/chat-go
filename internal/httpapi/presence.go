@@ -1,14 +1,34 @@
 package httpapi
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/presence"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
 )
+
+// announcePresence tells every client in the room to re-read the online list.
+//
+// Fire and forget, and it logs rather than returning an error. A nudge that
+// fails to send means somebody's list is a few seconds stale until their next
+// periodic re-read picks it up — not something worth failing a connection over.
+//
+// Published to a channel of its own rather than added to the chat channel, so no
+// consumer has to inspect a payload to work out what kind of thing it just got.
+func (h *Handlers) announcePresence(ctx context.Context, roomID int64) {
+	pubCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := h.Redis.Publish(pubCtx, hub.PresenceChannel(roomID), "changed").Err(); err != nil {
+		log.Printf("presence notify (room %d): %v", roomID, err)
+	}
+}
 
 // presenceResponse is the online list for one room.
 type presenceResponse struct {

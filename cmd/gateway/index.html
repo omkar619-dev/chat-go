@@ -29,6 +29,22 @@
                background: #eff6ff; border-left: 3px solid #2563eb; border-radius: 4px;
                white-space: pre-wrap; }
     #summary.waiting { color: #6b7280; font-style: italic; }
+    /* Room switcher */
+    #topbar { align-items: center; justify-content: space-between; margin-bottom: 0.7rem; }
+    #rooms { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+    #rooms button { background: #e5e7eb; color: #374151; padding: 0.35rem 0.7rem;
+                    font-size: 0.9em; }
+    #rooms button.current { background: #2563eb; color: #fff; }
+    /* A room you haven't joined looks different, because clicking it JOINS you. */
+    #rooms button.guest { border: 1px dashed #9ca3af; background: #fff; color: #6b7280; }
+    #signout { background: #6b7280; padding: 0.35rem 0.7rem; font-size: 0.9em; }
+    #newroom { margin-bottom: 0.7rem; }
+    #newroom input { flex: 1; font-size: 0.9em; padding: 0.35rem 0.5rem; }
+    #newroom button { background: #16a34a; padding: 0.35rem 0.7rem; font-size: 0.9em; }
+    #online { margin-bottom: 0.6rem; font-size: 0.9em; }
+    #online .label { color: #6b7280; text-transform: uppercase; font-size: 0.78em;
+                     letter-spacing: 0.06em; }
+    #onlinenames { color: #16a34a; font-weight: 600; }   /* green, like every other "online" dot */
     /* An error must not look like a summary. Same panel, unmistakably different. */
     #summary.error { background: #fef2f2; border-left-color: #dc2626; color: #991b1b;
                      font-weight: 500; }
@@ -47,6 +63,22 @@
 
   <!-- Chat view (hidden until logged in) -->
   <div id="chat">
+    <!-- One button per room. Filled from GET /rooms, which also tells us which
+         ones we're already a member of. -->
+    <div class="row" id="topbar">
+      <div id="rooms"></div>
+      <button id="signout" onclick="signOut()">Sign out</button>
+    </div>
+
+    <div class="row" id="newroom">
+      <input id="roomname" placeholder="new room name" autocomplete="off">
+      <button onclick="createRoom()">Create</button>
+    </div>
+
+    <!-- Who's online. Filled from GET /rooms/{id}/presence, which reads Redis —
+         so it shows people on the OTHER gateway too, not just this one. -->
+    <div id="online"><span class="label">Online</span> <span id="onlinenames">—</span></div>
+
     <div id="messages"></div>
     <div class="row">
       <input id="input" placeholder="type a message and hit Enter…" autocomplete="off">
@@ -68,8 +100,106 @@
   </div>
 
   <script>
-    const ROOM = 1;   // for this MVP everyone chats in room 1
-    let ws;           // will hold the open WebSocket once we're connected
+    // Which room we're currently in. Remembered across refreshes so reloading
+    // doesn't dump you back in room 1 — falls back to 1 the first time.
+    let room = Number(localStorage.getItem('chat_room')) || 1;
+    let ws;                 // will hold the open WebSocket once we're connected
+    let presenceTimer;      // the periodic online-list refresh
+
+    function token() { return localStorage.getItem('chat_token'); }
+    function authHeader() { return { 'Authorization': 'Bearer ' + token() }; }
+
+    // ── Rooms ────────────────────────────────────────────────────────────────
+    // Draws one button per room. The server tells us which ones we're a member
+    // of, so a room we haven't joined can look different — clicking it joins us.
+    async function refreshRooms() {
+      if (!token()) return;
+      const res = await fetch('/rooms', { headers: authHeader() });
+      if (!res.ok) return;
+      const rooms = await res.json();
+
+      const bar = document.getElementById('rooms');
+      bar.textContent = '';                    // rebuild rather than diff — it's a handful of buttons
+      for (const r of rooms) {
+        const b = document.createElement('button');
+        b.textContent = r.name;                // textContent, so a room named "<b>" can't inject markup
+        if (r.id === room) b.className = 'current';
+        else if (!r.member) b.className = 'guest';
+        b.onclick = () => switchRoom(r.id);
+        bar.appendChild(b);
+      }
+    }
+
+    // switchRoom moves us to another room. Reconnecting is the whole mechanism:
+    // a socket belongs to exactly one room on the server, so changing rooms means
+    // a new socket. connect() already clears the message list and resets
+    // presence, which is what stops the old room's content bleeding into the new
+    // one.
+    async function switchRoom(id) {
+      if (id === room) return;                 // already here; don't churn the socket
+      room = id;
+      localStorage.setItem('chat_room', String(id));
+      await connect(token());
+    }
+
+    // createRoom makes a room and drops you straight into it. The server adds the
+    // creator as a member automatically, so no separate join is needed.
+    async function createRoom() {
+      const input = document.getElementById('roomname');
+      const name = input.value.trim();
+      if (!name || !token()) return;
+
+      const res = await fetch('/rooms', {
+        method: 'POST',
+        headers: { ...authHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) return;
+      const created = await res.json();
+      input.value = '';
+      await switchRoom(created.id);
+    }
+
+    // ── Sign out ─────────────────────────────────────────────────────────────
+    // Forgets the token here and closes the socket. It does NOT revoke anything:
+    // the token stays valid on the server until it expires, so a copy of it would
+    // still work. That's a convenience button, not a security control — see I2 in
+    // docs/HARDENING.md for the real fix (short-lived tokens + a revocation list).
+    function signOut() {
+      if (ws) {
+        ws.onclose = null;                     // don't let the close handler fight us
+        ws.close();
+        ws = null;
+      }
+      clearInterval(presenceTimer);
+      localStorage.removeItem('chat_token');
+      localStorage.removeItem('chat_room');
+      document.getElementById('messages').textContent = '';
+      document.getElementById('onlinenames').textContent = '—';
+      document.getElementById('rooms').textContent = '';
+      document.getElementById('summary').style.display = 'none';
+      document.getElementById('chat').style.display = 'none';
+      document.getElementById('login').style.display = 'block';
+    }
+
+    // ── Who's online ─────────────────────────────────────────────────────────
+    // Reads the list from the server, which reads it from Redis — so this shows
+    // people connected to the OTHER gateway too, not just ours.
+    async function refreshPresence() {
+      if (!token()) return;
+      try {
+        const res = await fetch('/rooms/' + room + '/presence', { headers: authHeader() });
+        // Not ok usually means 503: presence is down but chat is fine. Leave the
+        // last known list on screen rather than blanking it — a stale list is
+        // more useful than an empty one, and the next attempt may well succeed.
+        if (!res.ok) return;
+        const { online } = await res.json();
+        document.getElementById('onlinenames').textContent =
+          online.length ? online.join(', ') : 'nobody';
+      } catch (e) {
+        // Network blip. Same reasoning: keep what we have and try again later.
+      }
+    }
 
     // On page load: if a token from a previous session is still saved, skip the
     // login form and reconnect. THIS is what stops a refresh from logging you
@@ -93,15 +223,18 @@
         document.getElementById('error').textContent = 'login failed';
         return;
       }
-      const { token } = await res.json();
-      localStorage.setItem('chat_token', token);   // remember it across refreshes
-      connect(token);
+      // Destructured to `tok` so it doesn't shadow the token() helper.
+      const { token: tok } = await res.json();
+      localStorage.setItem('chat_token', tok);   // remember it across refreshes
+      connect(tok);
     }
 
     // connect turns a token into a live chat session: join the room, open the
     // WebSocket, swap to the chat view. Shared by a fresh login AND the
     // auto-reconnect on load, so the logic lives in exactly one place.
-    async function connect(token) {
+    // `tok`, not `token` — there is a token() helper above and a parameter of the
+    // same name would shadow it inside this whole function.
+    async function connect(tok) {
       // Tear down any previous socket FIRST.
       //
       // connect() has two callers — the DOMContentLoaded auto-reconnect and
@@ -117,27 +250,45 @@
         ws.close();
         ws = null;
       }
+      clearInterval(presenceTimer);   // or reconnecting stacks a second timer
 
       // The server replays the last 50 messages on EVERY connect, so start from
       // an empty list — otherwise a reconnect appends a second copy of history
       // on top of the one already on screen.
       document.getElementById('messages').textContent = '';
 
-      // Make sure we're a member of the room (idempotent — safe to repeat).
-      await fetch('/rooms/' + ROOM + '/join', {
+      // The online list belongs to the room we're LEAVING, so clear it too.
+      // Without this, switching rooms briefly shows the old room's members as if
+      // they were in the new one.
+      document.getElementById('onlinenames').textContent = '—';
+
+      // Make sure we're a member of the room (idempotent — safe to repeat). This
+      // is also what makes clicking an unjoined room work: the click switches to
+      // it, and this joins us on the way in.
+      await fetch('/rooms/' + room + '/join', {
         method: 'POST',
-        headers: { 'Authorization': 'Bearer ' + token },
+        headers: { 'Authorization': 'Bearer ' + tok },
       });
 
       // Open the WebSocket — token + room ride in the query string.
       let opened = false;
-      ws = new WebSocket(`ws://${location.host}/ws?token=${token}&room=${ROOM}`);
+      ws = new WebSocket(`ws://${location.host}/ws?token=${tok}&room=${room}`);
 
       ws.onopen = () => {
         opened = true;
         document.getElementById('login').style.display = 'none';
         document.getElementById('chat').style.display = 'block';
         document.getElementById('input').focus();
+
+        // Redraw the room bar so the new room is the highlighted one, and so a
+        // room we just joined stops looking like one we haven't.
+        refreshRooms();
+        refreshPresence();
+        // A timer as well as the live nudges, because somebody TIMING OUT
+        // produces no event at all — nobody announces their own crash. This is
+        // what eventually removes them from the list.
+        clearInterval(presenceTimer);
+        presenceTimer = setInterval(refreshPresence, 20000);
       };
 
       // Every frame from the server carries a "type". Dispatch on it rather than
@@ -155,6 +306,12 @@
             break;
           case 'summary.done':
             awaitingFirstChunk = false;
+            break;
+          case 'presence':
+            // The server only says "it changed", never what it changed to, so
+            // there is one source of truth for the list instead of two that can
+            // disagree. Go and ask.
+            refreshPresence();
             break;
           case 'error':
             showError(frame.text);
@@ -282,9 +439,10 @@
 
       // encodeURIComponent escapes spaces, &, ? etc. Without it, a query like
       // "a & b" would be parsed as a second query parameter and silently truncated.
-      const token = localStorage.getItem('chat_token');
-      const res = await fetch(`/rooms/${ROOM}/search?q=${encodeURIComponent(q)}`, {
-        headers: { 'Authorization': 'Bearer ' + token },
+      // Searches the room you're currently IN, not room 1. Message embeddings are
+      // per room, so searching the wrong one silently returns nothing.
+      const res = await fetch(`/rooms/${room}/search?q=${encodeURIComponent(q)}`, {
+        headers: authHeader(),
       });
 
       results.innerHTML = '';

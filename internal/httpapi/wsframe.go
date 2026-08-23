@@ -15,6 +15,12 @@ const (
 	frameSummaryChunk = "summary.chunk" // one fragment of a streaming summary
 	frameSummaryDone  = "summary.done"  // the streaming summary finished
 	frameError        = "error"         // something went wrong with a request
+	// framePresence says "the online list changed, go and re-read it". It
+	// deliberately carries no names: sending the list here as well would mean two
+	// places producing the same answer, and two places that can disagree. One
+	// source of truth — GET /rooms/{id}/presence — and this is only a nudge to
+	// go and ask it.
+	framePresence = "presence"
 )
 
 // frame is one JSON object on the WebSocket.

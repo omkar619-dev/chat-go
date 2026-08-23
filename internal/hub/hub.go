@@ -35,21 +35,50 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Channel is the Redis pub/sub channel name for a room.
+// Channel is the Redis pub/sub channel carrying a room's chat messages.
 //
 // Exported so the PUBLISH side uses the same string as the SUBSCRIBE side. A
 // mismatch here delivers nothing at all and presents as a silently broken
 // socket, which is a miserable thing to debug.
 func Channel(roomID int64) string { return fmt.Sprintf("room:%d", roomID) }
 
+// PresenceChannel carries "somebody joined or left this room" notes.
+//
+// A SECOND channel rather than more traffic on the first one, because the two
+// are different kinds of thing: a chat message is content the client renders,
+// while this is a hint that the client should go and re-read the online list.
+// Squeezing both down one channel would mean every consumer inspecting each
+// payload to work out which it just received.
+//
+// Both channels live on the SAME Redis subscription — go-redis takes a list —
+// so a room still costs exactly one connection.
+func PresenceChannel(roomID int64) string { return fmt.Sprintf("room:%d:presence", roomID) }
+
+// Event kinds. Which channel a payload arrived on decides its kind.
+const (
+	KindMessage  = "message"  // a chat message; Payload is the message JSON
+	KindPresence = "presence" // somebody joined or left; Payload is meaningless
+)
+
+// Event is one thing that happened in a room.
+//
+// The hub used to hand out bare []byte, which worked while a room only ever
+// carried one kind of thing. Once there are two, the receiver has to be told
+// which it got — guessing from the shape of the payload is how quiet bugs get
+// written.
+type Event struct {
+	Kind    string
+	Payload []byte
+}
+
 // Subscription is one socket's view of a room. The caller ranges over C and
 // writes whatever arrives to its WebSocket.
 type Subscription struct {
-	// C delivers messages published to this room. It is CLOSED when the
+	// C delivers everything that happens in this room. It is CLOSED when the
 	// subscription ends — either because the caller called Close, or because the
 	// caller was too slow and the hub dropped it. Ranging over it therefore ends
 	// on its own; the caller does not need a separate done signal.
-	C <-chan []byte
+	C <-chan Event
 
 	// evicted is closed ONLY when the hub drops this subscription for being too
 	// slow. Never closed on a normal Close.
@@ -64,8 +93,8 @@ type Subscription struct {
 
 	hub    *Hub
 	roomID int64
-	userID int64       // carried only so presence can report who is here
-	c      chan []byte // the writable end of C
+	userID int64      // carried only so presence can report who is here
+	c      chan Event // the writable end of C
 	slow   atomic.Bool
 	once   sync.Once // close(c) exactly once, from either Close or broadcast
 }
@@ -137,7 +166,7 @@ func New(rdb *redis.Client, buffer int) *Hub {
 // but presence needs to answer "who is here", and the hub is the only thing that
 // knows. One user may hold several subscriptions (two tabs, phone and laptop).
 func (h *Hub) Join(roomID, userID int64) *Subscription {
-	ch := make(chan []byte, h.buf)
+	ch := make(chan Event, h.buf)
 	s := &Subscription{C: ch, c: ch, hub: h, roomID: roomID, userID: userID, evicted: make(chan struct{})}
 
 	h.mu.Lock()
@@ -153,7 +182,8 @@ func (h *Hub) Join(roomID, userID int64) *Subscription {
 		// user closed their tab. It is cancelled by Close when the last member
 		// leaves, and by nothing else.
 		ctx, cancel := context.WithCancel(context.Background())
-		ps := h.rdb.Subscribe(ctx, Channel(roomID))
+		// Both channels on one subscription — one Redis connection per room still.
+		ps := h.rdb.Subscribe(ctx, Channel(roomID), PresenceChannel(roomID))
 		r = &room{ps: ps, cancel: cancel, members: make(map[*Subscription]struct{})}
 		h.rooms[roomID] = r
 		go h.pump(ctx, roomID, r)
@@ -178,18 +208,24 @@ func (h *Hub) pump(ctx context.Context, roomID int64, r *room) {
 			// go-redis has given up reconnecting.
 			return
 		}
+		// Which channel it arrived on is what tells us what kind of thing it is.
+		kind := KindMessage
+		if msg.Channel == PresenceChannel(roomID) {
+			kind = KindPresence
+		}
+
 		// Pass r, not just roomID: broadcast must be able to tell whether this
 		// pump still owns the room. See the identity check there.
-		h.broadcast(roomID, r, []byte(msg.Payload))
+		h.broadcast(roomID, r, Event{Kind: kind, Payload: []byte(msg.Payload)})
 	}
 }
 
-// broadcast delivers one payload to every local member of a room.
+// broadcast delivers one event to every local member of a room.
 //
 // The SAME byte slice goes to every member — a zero-copy fan-out. The contract
 // is that nobody mutates it, which holds because the only consumer marshals it
 // into a frame and writes it.
-func (h *Hub) broadcast(roomID int64, from *room, payload []byte) {
+func (h *Hub) broadcast(roomID int64, from *room, ev Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -205,7 +241,7 @@ func (h *Hub) broadcast(roomID int64, from *room, payload []byte) {
 
 	for s := range r.members {
 		select {
-		case s.c <- payload:
+		case s.c <- ev:
 			// Queued for this socket's writer.
 		default:
 			// Buffer full: this reader cannot keep up.
@@ -230,6 +266,29 @@ func (h *Hub) broadcast(roomID int64, from *room, payload []byte) {
 			close(s.evicted) // only reachable once: we just removed s from members
 		}
 	}
+}
+
+// HasUser reports whether this process still holds any socket for that user in
+// that room.
+//
+// Presence needs it on disconnect: closing one tab should not mark you offline
+// while another tab of yours is still open. Answers only for THIS process — the
+// other gateway's sockets are invisible here, which is exactly why presence
+// lives in Redis rather than in memory.
+func (h *Hub) HasUser(roomID, userID int64) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	r, ok := h.rooms[roomID]
+	if !ok {
+		return false
+	}
+	for s := range r.members {
+		if s.userID == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // RoomMembers is a snapshot of who this process has connected to one room.
