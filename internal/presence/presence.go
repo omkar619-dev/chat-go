@@ -40,6 +40,41 @@ const (
 // Key is the Redis key holding one room's online list.
 func Key(roomID int64) string { return fmt.Sprintf("presence:room:%d", roomID) }
 
+// Online returns the user ids seen in this room recently enough to count.
+//
+// This read is the whole reason for storing presence as a sorted set scored by
+// time. "Everyone whose last-seen time is newer than 45 seconds ago" is a range
+// lookup — Redis jumps straight to the cutoff and reads forward. Stale entries
+// still sitting in the set are below the cutoff and never even looked at, which
+// is why pruning them is tidiness rather than something correctness needs.
+//
+// Takes the client as an argument rather than hanging off Tracker: the HTTP
+// handler already has a Redis client, and this way the 45-second rule stays
+// defined in exactly one place instead of being duplicated at the call site.
+func Online(ctx context.Context, rdb *redis.Client, roomID int64) ([]int64, error) {
+	cutoff := time.Now().Add(-stale).Unix()
+
+	raw, err := rdb.ZRangeByScore(ctx, Key(roomID), &redis.ZRangeBy{
+		Min: strconv.FormatInt(cutoff, 10),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]int64, 0, len(raw))
+	for _, s := range raw {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			// Not a user id. Skip it rather than failing the whole request over
+			// one junk entry — the online list is better slightly short than absent.
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // Tracker writes this gateway's online users into Redis on a timer.
 type Tracker struct {
 	rdb *redis.Client

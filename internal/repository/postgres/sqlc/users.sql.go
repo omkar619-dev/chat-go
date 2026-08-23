@@ -48,3 +48,37 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 	)
 	return i, err
 }
+
+const listUsernamesByIDs = `-- name: ListUsernamesByIDs :many
+SELECT username FROM users
+WHERE id = ANY($1::bigint[])
+ORDER BY username
+`
+
+// Names for a set of user ids. Presence stores ids in Redis; the UI shows names.
+//
+// ANY() takes the whole set in ONE query. The obvious alternative — a lookup per
+// user — would mean one database round trip per person in the room, so a busy
+// room would cost more trips the more popular it got.
+//
+// ORDER BY username so the online list doesn't shuffle between refreshes, which
+// would look like people joining and leaving when nothing changed.
+func (q *Queries) ListUsernamesByIDs(ctx context.Context, dollar_1 []int64) ([]string, error) {
+	rows, err := q.db.Query(ctx, listUsernamesByIDs, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var username string
+		if err := rows.Scan(&username); err != nil {
+			return nil, err
+		}
+		items = append(items, username)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

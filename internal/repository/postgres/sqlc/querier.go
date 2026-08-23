@@ -54,6 +54,15 @@ type Querier interface {
 	// into it. We take the NEWEST 200 unread and flip them back to chronological —
 	// the same inner/outer trick ListRecentMessages uses.
 	ListUnreadMessages(ctx context.Context, arg ListUnreadMessagesParams) ([]ListUnreadMessagesRow, error)
+	// Names for a set of user ids. Presence stores ids in Redis; the UI shows names.
+	//
+	// ANY() takes the whole set in ONE query. The obvious alternative — a lookup per
+	// user — would mean one database round trip per person in the room, so a busy
+	// room would cost more trips the more popular it got.
+	//
+	// ORDER BY username so the online list doesn't shuffle between refreshes, which
+	// would look like people joining and leaving when nothing changed.
+	ListUsernamesByIDs(ctx context.Context, dollar_1 []int64) ([]string, error)
 	// Semantic search within one room, nearest-meaning first.
 	//   <=>  is pgvector's cosine-DISTANCE operator: 0 = identical meaning, 2 = opposite.
 	//   Ordering ASC by distance therefore puts the best matches first, and this is

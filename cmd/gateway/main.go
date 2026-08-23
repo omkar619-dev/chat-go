@@ -119,7 +119,8 @@ func main() {
 		pr.Post("/", h.CreateRoom)
 		pr.Get("/", h.ListRooms)
 		pr.Post("/{id}/join", h.JoinRoom)
-		pr.Get("/{id}/search", h.SearchRoom) // semantic search over the room's history
+		pr.Get("/{id}/search", h.SearchRoom)     // semantic search over the room's history
+		pr.Get("/{id}/presence", h.RoomPresence) // who is online, across all gateways
 	})
 	r.Get("/ws", h.WS) // WebSocket upgrade; auth via ?token= query param
 

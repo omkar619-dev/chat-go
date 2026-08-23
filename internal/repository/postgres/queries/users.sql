@@ -6,3 +6,16 @@ RETURNING *;
 -- name: GetUserByUsername :one
 SELECT * FROM users
 WHERE username = $1;
+
+-- Names for a set of user ids. Presence stores ids in Redis; the UI shows names.
+--
+-- ANY() takes the whole set in ONE query. The obvious alternative — a lookup per
+-- user — would mean one database round trip per person in the room, so a busy
+-- room would cost more trips the more popular it got.
+--
+-- ORDER BY username so the online list doesn't shuffle between refreshes, which
+-- would look like people joining and leaving when nothing changed.
+-- name: ListUsernamesByIDs :many
+SELECT username FROM users
+WHERE id = ANY($1::bigint[])
+ORDER BY username;
