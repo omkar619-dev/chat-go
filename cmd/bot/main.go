@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -77,6 +78,26 @@ const (
 	minTopSimilarity = 0.50
 )
 
+// Load shedding. Answering costs an embedding call plus a generation that runs
+// from seconds to minutes on this hardware, so questions are QUEUED instead of
+// answered inline — otherwise one slow generation stops the bot reading Kafka at
+// all, and everybody behind it waits.
+//
+// The four knobs live in config (BOT_WORKERS, BOT_QUEUE, BOT_MAX_AGE,
+// BOT_RATE_PER_MIN) rather than as constants here. Shedding paths only run when
+// the system is under pressure, so proving they work at all means making the
+// limits absurdly tight on purpose — and doing that by editing constants means
+// remembering to change them back.
+//
+// Defaults: 2 workers (more does NOT mean faster; Ollama generates one answer at
+// a time, so extra workers only queue at Ollama instead of here — the pool exists
+// to keep the fetch loop moving and make the backlog explicit), a queue of 8
+// (small on purpose: unbounded, a burst becomes a backlog answered minutes late,
+// and a very late answer is worse than none because the room has moved on), a
+// 90s age limit (the same argument applied to time rather than depth), and 3
+// mentions per user per minute (generation is the most expensive thing in the
+// system, so it is the obvious thing to abuse).
+
 // systemPrompt is the bot's standing instruction. The two rules that matter are
 // "use ONLY the excerpts" and "say you don't know" — together they're what makes
 // this RAG rather than just a chatbot. Without the second rule a model under
@@ -128,6 +149,26 @@ func main() {
 	consumer := broker.NewConsumer(cfg.KafkaBroker, cfg.KafkaTopic, "bot")
 	defer consumer.Close()
 
+	d := deps{
+		queries: queries, rdb: rdb, embedder: embedder, generator: generator,
+		producer: producer, botID: botID,
+		maxAge: cfg.BotMaxAge, ratePerMin: cfg.BotRatePerMin, queueSize: cfg.BotQueue,
+	}
+	log.Printf("shedding: %d workers, queue %d, max age %s, %d mentions/user/min",
+		cfg.BotWorkers, cfg.BotQueue, cfg.BotMaxAge, cfg.BotRatePerMin)
+
+	// Questions go here instead of being answered inline. The fetch loop below
+	// then never blocks on a generation, which is the whole point.
+	jobs := make(chan broker.ChatMessage, cfg.BotQueue)
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.BotWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker(ctx, d, jobs)
+		}()
+	}
+
 	for {
 		msg, err := consumer.Fetch(ctx)
 		if err != nil {
@@ -140,31 +181,32 @@ func main() {
 
 		var m broker.ChatMessage
 		if err := json.Unmarshal(msg.Value, &m); err == nil {
-			handle(ctx, deps{queries, rdb, embedder, generator, producer, botID}, m)
+			dispatch(ctx, d, jobs, m)
 		}
 
-		// Commit whether or not we answered. Unlike the persister, we do NOT retry
-		// on failure: the bot must never block the partition. At-most-once-ish, and
-		// that's the right tradeoff for a non-critical consumer.
+		// Commit whether or not we answered — and now, whether or not we have even
+		// STARTED. Queueing then committing means a question sitting in the queue
+		// when the process dies is gone for good, which sounds bad until you
+		// remember the alternative: holding the offset open makes the bot's lag
+		// grow with its backlog, and it would replay questions minutes old on
+		// restart — the exact thing botMaxAge exists to prevent. The bot was always
+		// best-effort; this makes the boundary explicit.
 		if err := consumer.Commit(ctx, msg); err != nil {
 			log.Printf("commit at offset %d: %v", msg.Offset, err)
 		}
 	}
 
+	// Let the workers finish what they already picked up, rather than cutting a
+	// half-generated answer off mid-flight.
+	close(jobs)
+	wg.Wait()
+
 	log.Println("bot shutting down")
 }
 
-// deps bundles what handle needs, so its signature stays readable.
-type deps struct {
-	queries   *sqlc.Queries
-	rdb       *redis.Client
-	embedder  *embed.Client
-	generator *llm.Client
-	producer  *broker.Producer
-	botID     int64
-}
-
-func handle(ctx context.Context, d deps, m broker.ChatMessage) {
+// dispatch decides whether a question is worth queueing. It NEVER blocks —
+// blocking here would defeat the queue entirely.
+func dispatch(ctx context.Context, d deps, jobs chan<- broker.ChatMessage, m broker.ChatMessage) {
 	// LOOP GUARD — the single most important line in this file. The bot's own
 	// replies go back into the same log it's reading. Without this check, a reply
 	// that happens to contain "@bot" would trigger another reply, forever, each one
@@ -178,6 +220,95 @@ func handle(ctx context.Context, d deps, m broker.ChatMessage) {
 		return
 	}
 
+	// Checked BEFORE queueing, so a spammer cannot fill the queue and push out
+	// everyone else's questions.
+	if !allow(ctx, d.rdb, m.UserID, d.ratePerMin) {
+		log.Printf("rate limited: user %d is over %d mentions/min", m.UserID, d.ratePerMin)
+		return
+	}
+
+	select {
+	case jobs <- m:
+	default:
+		// SHED. The queue is full, so the bot is already further behind than it can
+		// usefully catch up on. Dropping is deliberate, not a failure.
+		//
+		// Deliberately NOT replying "I'm busy": that reply is itself a message in
+		// the room, so a spammer would turn one flood into two.
+		log.Printf("shed question from user %d in room %d: queue full at %d",
+			m.UserID, m.RoomID, d.queueSize)
+	}
+}
+
+// worker answers whatever it is handed, one question at a time.
+func worker(ctx context.Context, d deps, jobs <-chan broker.ChatMessage) {
+	for m := range jobs {
+		// How long has this been waiting? A question answered two minutes late is
+		// noise — the room has moved on and nobody can tell what it replies to. The
+		// queue bound limits the backlog by DEPTH; this limits it by TIME, which is
+		// what actually matters to the person waiting.
+		if age := time.Since(m.SentAt); age > d.maxAge {
+			// Rounded to MILLISECONDS, not seconds. Rounding to seconds printed
+			// "0s stale" for everything under half a second, which is exactly the
+			// range you care about when you have tightened the limit to prove the
+			// branch runs — a log line that hides the number it exists to report.
+			log.Printf("dropped question from user %d in room %d: %s stale",
+				m.UserID, m.RoomID, age.Round(time.Millisecond))
+			continue
+		}
+		handle(ctx, d, m)
+	}
+}
+
+// allow reports whether this user may ask another question this minute.
+//
+// The current minute is part of the KEY, so each minute gets a fresh counter that
+// expires on its own — no cleanup job, and no need for INCR and EXPIRE to be
+// atomic with each other.
+//
+// This is a fixed window, not a sliding one, so somebody can technically fit
+// 2 x botRatePerMin questions across a window boundary. Not worth a sorted set to
+// fix: the goal is to stop one person monopolising the model, not to enforce an
+// exact quota.
+func allow(ctx context.Context, rdb *redis.Client, userID int64, perMin int) bool {
+	key := fmt.Sprintf("bot:rate:%d:%d", userID, time.Now().Unix()/60)
+
+	n, err := rdb.Incr(ctx, key).Result()
+	if err != nil {
+		// Redis unreachable: FAIL OPEN. This limit exists to curb abuse, and going
+		// silent for every user because an unrelated component is down is a worse
+		// outcome than letting a few extra questions through. Different call from
+		// the JWT secret, which fails closed — that one guards access, this one
+		// guards cost.
+		log.Printf("rate limit check failed, allowing: %v", err)
+		return true
+	}
+	if n == 1 {
+		// Only on the first increment of a new minute.
+		rdb.Expire(ctx, key, 2*time.Minute)
+	}
+	return n <= int64(perMin)
+}
+
+// deps bundles what handle needs, so its signature stays readable.
+type deps struct {
+	queries   *sqlc.Queries
+	rdb       *redis.Client
+	embedder  *embed.Client
+	generator *llm.Client
+	producer  *broker.Producer
+	botID     int64
+
+	// Shedding limits, carried here so the functions that enforce them don't each
+	// have to reach for global state.
+	maxAge     time.Duration
+	ratePerMin int
+	queueSize  int // for the log line only, so it can say what it hit
+}
+
+// handle answers one question. The loop guard and the mention check live in
+// dispatch instead, so work we would only discard never takes a queue slot.
+func handle(ctx context.Context, d deps, m broker.ChatMessage) {
 	// Strip the mention to get the actual question — same pattern, so any case
 	// that was matched above is also removed here.
 	question := strings.TrimSpace(mentionPattern.ReplaceAllString(m.Body, ""))

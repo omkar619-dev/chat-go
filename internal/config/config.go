@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 // devJWTSecret is the placeholder that used to be a silent default. It stays
@@ -23,6 +24,15 @@ type Config struct {
 	EmbedModel  string // embedding model name (must match the schema's vector size)
 	ChatModel   string // generation model name, used by the RAG bot
 	HubBuffer   int    // messages that may queue for one socket before the hub drops it
+
+	// Bot load shedding. Env-tunable rather than constants because these are
+	// exactly the values you want to make extreme in order to PROVE the shedding
+	// paths run — and editing constants to test them means remembering to change
+	// them back, which is how a test value reaches production.
+	BotWorkers    int           // concurrent answers; more does not mean faster, Ollama serialises
+	BotQueue      int           // questions that may wait before new ones are shed
+	BotMaxAge     time.Duration // a question older than this when picked up is binned
+	BotRatePerMin int           // per-user mention budget
 }
 
 // Load reads config from environment variables, falling back to local-dev
@@ -69,7 +79,21 @@ func Load() Config {
 		// now sweep it. Too small and ordinary network hiccups evict people; too
 		// large and a stalled socket holds memory for messages it will never read.
 		HubBuffer: getenvInt("HUB_BUFFER", 64),
+
+		BotWorkers:    getenvInt("BOT_WORKERS", 2),
+		BotQueue:      getenvInt("BOT_QUEUE", 8),
+		BotMaxAge:     getenvDuration("BOT_MAX_AGE", 90*time.Second),
+		BotRatePerMin: getenvInt("BOT_RATE_PER_MIN", 3),
 	}
+}
+
+// getenvDuration parses values like "90s", "500ms" or "2m". Falls back on
+// anything unparseable rather than refusing to boot over a typo in a knob.
+func getenvDuration(key string, fallback time.Duration) time.Duration {
+	if d, err := time.ParseDuration(os.Getenv(key)); err == nil && d > 0 {
+		return d
+	}
+	return fallback
 }
 
 // getenvInt is getenv for integers, falling back on anything unparseable rather
