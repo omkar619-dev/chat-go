@@ -54,10 +54,25 @@ func Channel(roomID int64) string { return fmt.Sprintf("room:%d", roomID) }
 // so a room still costs exactly one connection.
 func PresenceChannel(roomID int64) string { return fmt.Sprintf("room:%d:presence", roomID) }
 
+// SignalChannel carries WebRTC signalling notes between two people in the room.
+//
+// A third channel for the same reason as the second: the channel a payload
+// arrives on says what kind of thing it is, so nothing has to inspect a payload
+// to find out. Still one Redis subscription per room — go-redis takes a list of
+// channels — so adding calling costs no extra connections.
+//
+// Note these notes are addressed to ONE person but published to the whole room.
+// The alternative, a channel per user, is one subscription per user: exactly the
+// design that cost 172 bytes per subscriber per message before it was fixed.
+// Signalling is a handful of notes per call, so having every gateway in the room
+// see one and ignore it is far cheaper than a subscription each.
+func SignalChannel(roomID int64) string { return fmt.Sprintf("room:%d:signal", roomID) }
+
 // Event kinds. Which channel a payload arrived on decides its kind.
 const (
 	KindMessage  = "message"  // a chat message; Payload is the message JSON
 	KindPresence = "presence" // somebody joined or left; Payload is meaningless
+	KindSignal   = "signal"   // a WebRTC note for ONE member; Payload is broker.Signal
 )
 
 // Event is one thing that happened in a room.
@@ -182,8 +197,8 @@ func (h *Hub) Join(roomID, userID int64) *Subscription {
 		// user closed their tab. It is cancelled by Close when the last member
 		// leaves, and by nothing else.
 		ctx, cancel := context.WithCancel(context.Background())
-		// Both channels on one subscription — one Redis connection per room still.
-		ps := h.rdb.Subscribe(ctx, Channel(roomID), PresenceChannel(roomID))
+		// All three channels on one subscription — one Redis connection per room.
+		ps := h.rdb.Subscribe(ctx, Channel(roomID), PresenceChannel(roomID), SignalChannel(roomID))
 		r = &room{ps: ps, cancel: cancel, members: make(map[*Subscription]struct{})}
 		h.rooms[roomID] = r
 		go h.pump(ctx, roomID, r)
@@ -209,9 +224,14 @@ func (h *Hub) pump(ctx context.Context, roomID int64, r *room) {
 			return
 		}
 		// Which channel it arrived on is what tells us what kind of thing it is.
-		kind := KindMessage
-		if msg.Channel == PresenceChannel(roomID) {
+		var kind string
+		switch msg.Channel {
+		case PresenceChannel(roomID):
 			kind = KindPresence
+		case SignalChannel(roomID):
+			kind = KindSignal
+		default:
+			kind = KindMessage
 		}
 
 		// Pass r, not just roomID: broadcast must be able to tell whether this

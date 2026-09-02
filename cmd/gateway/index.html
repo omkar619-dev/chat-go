@@ -307,6 +307,11 @@
           case 'summary.done':
             awaitingFirstChunk = false;
             break;
+          case 'signal':
+            // Piece 2 turns these into an actual call. For now just log, so the
+            // relay can be verified end to end before any WebRTC exists.
+            console.log('signal', frame.kind, 'from user', frame.from, frame.signal);
+            break;
           case 'presence':
             // The server only says "it changed", never what it changed to, so
             // there is one source of truth for the list instead of two that can

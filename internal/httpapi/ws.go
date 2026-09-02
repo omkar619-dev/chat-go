@@ -175,6 +175,21 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 				f = messageFrame(ev.Payload)
 			case hub.KindPresence:
 				f = frame{Type: framePresence}
+			case hub.KindSignal:
+				// Signalling notes are addressed to ONE person but published to the
+				// whole room, so every socket sees each note and all but one drop it.
+				// The filter lives here rather than in the hub deliberately: the hub
+				// stays a dumb pipe that knows nothing about calls, and the room
+				// boundary doubles as the security boundary — a note can only ever
+				// reach a member of the room it was published to.
+				var sig broker.Signal
+				if err := json.Unmarshal(ev.Payload, &sig); err != nil {
+					continue
+				}
+				if sig.To != claims.UserID {
+					continue // not for us
+				}
+				f = frame{Type: frameSignal, From: sig.From, Kind: sig.Kind, Signal: sig.Data}
 			default:
 				continue // a kind this build doesn't know; ignore rather than guess
 			}
@@ -214,10 +229,25 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 			return // client disconnected
 		}
 
+		trimmed := strings.TrimSpace(string(data))
+
+		// A leading brace means the browser sent a structured frame rather than
+		// something to say. Only WebRTC signalling uses this so far.
+		//
+		// Sniffing on "{" keeps plain text working, so chat and /catchup are
+		// untouched — but it does mean a chat message that literally starts with a
+		// brace would be misread. Noted rather than pretended away; the honest fix
+		// is to make the whole inbound direction typed, which is a protocol change
+		// worth making once rather than twice.
+		if strings.HasPrefix(trimmed, "{") {
+			h.handleClientFrame(ctx, conn, roomID, claims.UserID, []byte(trimmed))
+			continue
+		}
+
 		// Slash commands are handled here and NOT published — they're a request to
 		// the gateway, not a message to the room. Note this runs in a goroutine so
 		// the user can keep chatting while a summary streams.
-		if strings.EqualFold(strings.TrimSpace(string(data)), catchupCommand) {
+		if strings.EqualFold(trimmed, catchupCommand) {
 			go h.streamCatchup(ctx, conn, roomID, claims.UserID)
 			continue
 		}

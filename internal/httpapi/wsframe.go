@@ -21,6 +21,9 @@ const (
 	// source of truth — GET /rooms/{id}/presence — and this is only a nudge to
 	// go and ask it.
 	framePresence = "presence"
+	// frameSignal carries one WebRTC note for THIS user. The server relays these
+	// without understanding them — see broker.Signal.
+	frameSignal = "signal"
 )
 
 // frame is one JSON object on the WebSocket.
@@ -43,6 +46,31 @@ type frame struct {
 	Type    string          `json:"type"`
 	Message json.RawMessage `json:"message,omitempty"` // set when Type == frameMessage
 	Text    string          `json:"text,omitempty"`    // set for summary chunks / errors
+
+	// Set only when Type == frameSignal.
+	From   int64           `json:"from,omitempty"`   // who is calling / answering
+	Kind   string          `json:"kind,omitempty"`   // offer | answer | ice | hangup
+	Signal json.RawMessage `json:"signal,omitempty"` // opaque to us; the browser's SDP or candidate
+}
+
+// clientFrame is what the BROWSER sends UP the socket.
+//
+// Until now the inbound direction carried plain text: either a chat message or
+// the "/catchup" slash command. That was enough while everything inbound was a
+// string. WebRTC is not — a session description is a multi-line blob and an ICE
+// candidate is a structured object — so inbound needs a real format too.
+//
+// Plain text still works, so nothing that already worked has changed: the read
+// loop only parses JSON when the message starts with "{". Sniffing on a brace is
+// a little crude, and it is written down here rather than left implicit.
+type clientFrame struct {
+	Type string `json:"type"` // "signal"
+	To   int64  `json:"to"`   // which member of the room this is for
+
+	// Kind and Data are passed straight through to the recipient. The server does
+	// not look inside Data — see broker.Signal for why that is deliberate.
+	Kind string          `json:"kind"`
+	Data json.RawMessage `json:"data,omitempty"`
 }
 
 // writeFrame marshals a frame and sends it as one WebSocket text message.
