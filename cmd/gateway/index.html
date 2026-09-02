@@ -45,6 +45,22 @@
     #online .label { color: #6b7280; text-transform: uppercase; font-size: 0.78em;
                      letter-spacing: 0.06em; }
     #onlinenames { color: #16a34a; font-weight: 600; }   /* green, like every other "online" dot */
+    #onlinenames .person { margin-right: 0.6rem; white-space: nowrap; }
+    .callbtn { background: #16a34a; padding: 0.1rem 0.4rem; font-size: 0.75em;
+               margin-left: 0.25rem; vertical-align: middle; }
+
+    /* Calling */
+    #ringing { margin: 0.6rem 0; padding: 0.6rem 0.8rem; background: #fffbeb;
+               border-left: 3px solid #f59e0b; border-radius: 4px; }
+    #ringing button { padding: 0.25rem 0.6rem; font-size: 0.85em; margin-left: 0.4rem; }
+    #ringing .accept { background: #16a34a; }
+    #ringing .reject { background: #dc2626; }
+    #callarea { margin: 0.6rem 0; padding: 0.6rem; background: #f3f4f6; border-radius: 6px; }
+    #callarea video { width: 48%; background: #000; border-radius: 4px; }
+    /* muted on the local video is not cosmetic — without it you hear yourself
+       through your own speakers and the mic picks it up again. */
+    #callinfo { font-size: 0.85em; color: #374151; margin: 0.4rem 0; font-family: ui-monospace, monospace; }
+    #callarea .hangup { background: #dc2626; padding: 0.3rem 0.7rem; font-size: 0.85em; }
     /* An error must not look like a summary. Same panel, unmistakably different. */
     #summary.error { background: #fef2f2; border-left-color: #dc2626; color: #991b1b;
                      font-weight: 500; }
@@ -79,6 +95,21 @@
          so it shows people on the OTHER gateway too, not just this one. -->
     <div id="online"><span class="label">Online</span> <span id="onlinenames">—</span></div>
 
+    <!-- Somebody is calling us. Hidden until an offer arrives. -->
+    <div id="ringing" hidden>
+      <span id="ringingwho"></span>
+      <button class="accept" onclick="acceptCall()">Accept</button>
+      <button class="reject" onclick="rejectCall()">Reject</button>
+    </div>
+
+    <!-- The call itself. `muted` on the local video stops you hearing yourself. -->
+    <div id="callarea" hidden>
+      <video id="localvideo" autoplay muted playsinline></video>
+      <video id="remotevideo" autoplay playsinline></video>
+      <div id="callinfo"></div>
+      <button class="hangup" onclick="hangUp()">Hang up</button>
+    </div>
+
     <div id="messages"></div>
     <div class="row">
       <input id="input" placeholder="type a message and hit Enter…" autocomplete="off">
@@ -108,6 +139,256 @@
 
     function token() { return localStorage.getItem('chat_token'); }
     function authHeader() { return { 'Authorization': 'Bearer ' + token() }; }
+
+    // ── WebRTC calling ───────────────────────────────────────────────────────
+    //
+    // STUN only, for now. A STUN server does one small thing: it tells a browser
+    // what its own public address looks like from the outside. It relays nothing,
+    // which is why public ones are free to use. TURN — an actual relay — comes
+    // later, once we have MEASURED how often a direct connection fails.
+    const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+
+    let pc = null;             // the live connection, if there is one
+    let localStream = null;    // our camera and microphone
+    let peerId = 0;            // who we are on a call with
+    let peerName = '';
+    let pendingOffer = null;   // an incoming offer waiting for Accept
+    let pendingIce = [];       // candidates that arrived before we had a remote description
+    let onlineById = {};       // id -> username, so an incoming call has a name
+
+    // Reads the uid claim out of the JWT we are already holding.
+    //
+    // This is NOT verification — the server checks the signature on every single
+    // request and never trusts anything the browser says. We only need to know
+    // which of the online people is us, so we don't draw a "call yourself" button.
+    function myUserId() {
+      const t = token();
+      if (!t) return 0;
+      try { return JSON.parse(atob(t.split('.')[1])).uid || 0; } catch (e) { return 0; }
+    }
+
+    function sendSignal(to, kind, data) {
+      if (!ws) return;
+      ws.send(JSON.stringify({ type: 'signal', to, kind, data }));
+    }
+
+    function callStatus(text) {
+      document.getElementById('callinfo').textContent = text;
+    }
+
+    async function getMedia() {
+      if (localStream) return localStream;
+      // Browsers refuse this on plain http:// — localhost is the only exception.
+      // That is why the two-real-networks test needs HTTPS.
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch (e) {
+        // A camera that is missing, blocked, or already held by another
+        // application should not mean no call at all — audio alone is still a
+        // call. Ask again without video before giving up.
+        //
+        // Found the honest way: on one machine with one webcam, the SECOND
+        // browser genuinely cannot open it (NotReadableError, "could not start
+        // video source"), because plenty of Windows camera drivers are
+        // exclusive-access and Chrome cannot share across instances.
+        console.warn('video unavailable, falling back to audio:', e.name, e.message);
+        localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        showError('camera unavailable (' + e.name + ') — audio only');
+      }
+      document.getElementById('localvideo').srcObject = localStream;
+      return localStream;
+    }
+
+    // newPeerConnection wires up the three things that matter: our candidates
+    // going out, their media coming in, and the moment it connects or gives up.
+    function newPeerConnection(otherId) {
+      const c = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+
+      // Trickle ICE: addresses are discovered over a second or two and sent as
+      // each one appears, rather than waiting for the complete list. Waiting
+      // would add that delay to the start of every call.
+      c.onicecandidate = (e) => {
+        if (e.candidate) sendSignal(otherId, 'ice', e.candidate.toJSON());
+      };
+
+      c.ontrack = (e) => {
+        document.getElementById('remotevideo').srcObject = e.streams[0];
+      };
+
+      c.onconnectionstatechange = () => {
+        if (c.connectionState === 'connected') {
+          // Deliberately NOT writing a status line here first. reportPath is
+          // about to write the ICE path, which is the number this whole phase
+          // exists to produce — and this handler can fire more than once, so a
+          // plain "connected" would overwrite the measurement moments after it
+          // appeared. Observed exactly that on one side of the first call.
+          reportPath(c);
+          return;
+        }
+        callStatus('connection: ' + c.connectionState);
+        if (c.connectionState === 'failed' || c.connectionState === 'closed') endCall();
+      };
+      return c;
+    }
+
+    // reportPath asks the browser WHICH ROUTE the media actually took. This is
+    // the measurement the whole phase exists for:
+    //
+    //   host   both ends on the same network, no NAT in the way
+    //   srflx  through NAT, address discovered via STUN, still peer-to-peer
+    //   relay  a direct path was impossible, so everything goes via TURN
+    //
+    // On one laptop this will always say host <-> host. That proves the plumbing
+    // and measures nothing — the number only becomes real once one side is
+    // genuinely on a different network.
+    async function reportPath(c) {
+      const stats = await c.getStats();
+      let pair = null;
+      stats.forEach((r) => {
+        if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) pair = r;
+      });
+      if (!pair) return;
+      const local = stats.get(pair.localCandidateId);
+      const remote = stats.get(pair.remoteCandidateId);
+      const path = (local ? local.candidateType : '?') + ' <-> ' + (remote ? remote.candidateType : '?');
+      const rtt = pair.currentRoundTripTime;
+      callStatus('connected via ' + path + (rtt ? '  rtt ' + Math.round(rtt * 1000) + 'ms' : ''));
+      console.log('ICE path', path, 'rtt', rtt, pair);
+    }
+
+    async function startCall(otherId, otherName) {
+      if (pc) { callStatus('already on a call'); return; }
+      peerId = otherId;
+      peerName = otherName;
+      document.getElementById('callarea').hidden = false;
+      callStatus('calling ' + otherName + '…');
+      try {
+        const stream = await getMedia();
+        pc = newPeerConnection(otherId);
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+        await pc.setLocalDescription(await pc.createOffer());
+        sendSignal(otherId, 'offer', { type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+      } catch (e) {
+        // showError, NOT callStatus. callStatus writes into the call area, and
+        // endCall() hides that box a line later — so the explanation vanished
+        // exactly when it was needed. The error panel outlives the call.
+        console.error('startCall failed', e);
+        showError('could not start the call: ' + e.name + ' — ' + e.message);
+        endCall();
+      }
+    }
+
+    function onOffer(fromId, sdp) {
+      if (pc) {
+        // Already busy. Tell them rather than leaving them ringing forever.
+        sendSignal(fromId, 'hangup', {});
+        return;
+      }
+      pendingOffer = { fromId, sdp };
+      document.getElementById('ringingwho').textContent =
+        (onlineById[fromId] || ('user ' + fromId)) + ' is calling…';
+      document.getElementById('ringing').hidden = false;
+    }
+
+    async function acceptCall() {
+      if (!pendingOffer) return;
+      const { fromId, sdp } = pendingOffer;
+      pendingOffer = null;
+      document.getElementById('ringing').hidden = true;
+
+      peerId = fromId;
+      peerName = onlineById[fromId] || ('user ' + fromId);
+      document.getElementById('callarea').hidden = false;
+      callStatus('connecting to ' + peerName + '…');
+      try {
+        const stream = await getMedia();
+        pc = newPeerConnection(fromId);
+        stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+        await drainPendingIce();
+        await pc.setLocalDescription(await pc.createAnswer());
+        sendSignal(fromId, 'answer', { type: pc.localDescription.type, sdp: pc.localDescription.sdp });
+      } catch (e) {
+        console.error('acceptCall failed', e);
+        showError('could not answer: ' + e.name + ' — ' + e.message);
+        endCall();
+      }
+    }
+
+    function rejectCall() {
+      if (!pendingOffer) return;
+      sendSignal(pendingOffer.fromId, 'hangup', {});
+      pendingOffer = null;
+      pendingIce = [];
+      document.getElementById('ringing').hidden = true;
+    }
+
+    async function onAnswer(sdp) {
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+      await drainPendingIce();
+    }
+
+    // Candidates can arrive BEFORE the offer or answer they belong to. They are
+    // sent the instant each is discovered, and nothing promises they overtake the
+    // description in transit. Adding one with no remote description set throws,
+    // so they queue until there is one.
+    //
+    // This is the classic trickle-ICE bug, and it is nasty because it hides: on a
+    // fast local network the description almost always wins the race, so calls
+    // work in testing and fail as soon as there is real latency.
+    async function onIce(candidate) {
+      if (!pc || !pc.remoteDescription) { pendingIce.push(candidate); return; }
+      try { await pc.addIceCandidate(candidate); } catch (e) { console.warn('ice', e); }
+    }
+
+    async function drainPendingIce() {
+      for (const c of pendingIce) {
+        try { await pc.addIceCandidate(c); } catch (e) { console.warn('queued ice', e); }
+      }
+      pendingIce = [];
+    }
+
+    function hangUp() {
+      if (peerId) sendSignal(peerId, 'hangup', {});
+      endCall();
+    }
+
+    // endCall always stops the camera and microphone.
+    //
+    // Forgetting that leaves the camera light on after the call has ended, which
+    // people notice and are right to find alarming. Closing the RTCPeerConnection
+    // does NOT release the devices — the tracks are ours, not its.
+    function endCall() {
+      if (pc) {
+        pc.onicecandidate = null;
+        pc.ontrack = null;
+        pc.onconnectionstatechange = null;
+        pc.close();
+        pc = null;
+      }
+      pendingIce = [];
+      pendingOffer = null;
+      peerId = 0;
+      peerName = '';
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+        localStream = null;
+      }
+      document.getElementById('localvideo').srcObject = null;
+      document.getElementById('remotevideo').srcObject = null;
+      document.getElementById('callarea').hidden = true;
+      document.getElementById('ringing').hidden = true;
+    }
+
+    function handleSignal(from, kind, data) {
+      switch (kind) {
+        case 'offer':  onOffer(from, data); break;
+        case 'answer': onAnswer(data); break;
+        case 'ice':    onIce(data); break;
+        case 'hangup': callStatus('call ended'); endCall(); break;
+      }
+    }
 
     // ── Rooms ────────────────────────────────────────────────────────────────
     // Draws one button per room. The server tells us which ones we're a member
@@ -172,6 +453,7 @@
         ws = null;
       }
       clearInterval(presenceTimer);
+      endCall();                      // and definitely release the camera
       localStorage.removeItem('chat_token');
       localStorage.removeItem('chat_room');
       document.getElementById('messages').textContent = '';
@@ -194,8 +476,29 @@
         // more useful than an empty one, and the next attempt may well succeed.
         if (!res.ok) return;
         const { online } = await res.json();
-        document.getElementById('onlinenames').textContent =
-          online.length ? online.join(', ') : 'nobody';
+
+        // Rebuilt rather than diffed — it's a handful of names, and a diff would
+        // be more code than it saves.
+        onlineById = {};
+        const me = myUserId();
+        const box = document.getElementById('onlinenames');
+        box.textContent = '';
+        if (!online.length) { box.textContent = 'nobody'; return; }
+
+        for (const u of online) {
+          onlineById[u.id] = u.username;
+          const span = document.createElement('span');
+          span.className = 'person';
+          span.textContent = u.username;   // textContent, so a username can't inject markup
+          if (u.id !== me) {
+            const b = document.createElement('button');
+            b.className = 'callbtn';
+            b.textContent = 'call';
+            b.onclick = () => startCall(u.id, u.username);
+            span.appendChild(b);
+          }
+          box.appendChild(span);
+        }
       } catch (e) {
         // Network blip. Same reasoning: keep what we have and try again later.
       }
@@ -251,6 +554,11 @@
         ws = null;
       }
       clearInterval(presenceTimer);   // or reconnecting stacks a second timer
+
+      // A call belongs to the room it started in, and signalling only reaches
+      // members of that room — so leaving strands the other side. End it here
+      // rather than leaving a dead video box and a live camera on screen.
+      endCall();
 
       // The server replays the last 50 messages on EVERY connect, so start from
       // an empty list — otherwise a reconnect appends a second copy of history
@@ -308,9 +616,7 @@
             awaitingFirstChunk = false;
             break;
           case 'signal':
-            // Piece 2 turns these into an actual call. For now just log, so the
-            // relay can be verified end to end before any WebRTC exists.
-            console.log('signal', frame.kind, 'from user', frame.from, frame.signal);
+            handleSignal(frame.from, frame.kind, frame.signal);
             break;
           case 'presence':
             // The server only says "it changed", never what it changed to, so

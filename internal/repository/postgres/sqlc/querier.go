@@ -77,7 +77,9 @@ type Querier interface {
 	//
 	// ORDER BY username so the online list doesn't shuffle between refreshes, which
 	// would look like people joining and leaving when nothing changed.
-	ListUsernamesByIDs(ctx context.Context, dollar_1 []int64) ([]string, error)
+	// Returns the id as well as the name, because the online list is now clickable:
+	// calling somebody needs their user id, and names are not identifiers.
+	ListUsersByIDs(ctx context.Context, dollar_1 []int64) ([]ListUsersByIDsRow, error)
 	// Semantic search within one room, nearest-meaning first.
 	//   <=>  is pgvector's cosine-DISTANCE operator: 0 = identical meaning, 2 = opposite.
 	//   Ordering ASC by distance therefore puts the best matches first, and this is

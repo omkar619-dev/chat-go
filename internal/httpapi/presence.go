@@ -30,9 +30,18 @@ func (h *Handlers) announcePresence(ctx context.Context, roomID int64) {
 	}
 }
 
+// onlineUser is one person in the online list.
+//
+// The id is here because the list is clickable now — starting a call needs the
+// recipient's user id, and a username is a label, not an identifier.
+type onlineUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
 // presenceResponse is the online list for one room.
 type presenceResponse struct {
-	Online []string `json:"online"`
+	Online []onlineUser `json:"online"`
 }
 
 // RoomPresence answers "who is online in this room right now?"
@@ -74,21 +83,23 @@ func (h *Handlers) RoomPresence(w http.ResponseWriter, r *http.Request) {
 	// An empty room is a normal answer, not an error. Return early so we don't
 	// ask Postgres to look up nothing.
 	if len(ids) == 0 {
-		writeJSON(w, http.StatusOK, presenceResponse{Online: []string{}})
+		writeJSON(w, http.StatusOK, presenceResponse{Online: []onlineUser{}})
 		return
 	}
 
 	// 4. Turn ids into names, in one query rather than one per person.
-	names, err := h.Queries.ListUsernamesByIDs(r.Context(), ids)
+	rows, err := h.Queries.ListUsersByIDs(r.Context(), ids)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read presence")
 		return
 	}
 
-	// `[]string{}` and not a nil slice: a nil slice encodes as JSON `null`, and
-	// the client would have to special-case it. An empty list is `[]`.
-	if names == nil {
-		names = []string{}
+	// A slice built with make(...,0,n) and not a nil one: a nil slice encodes as
+	// JSON `null`, and the client would have to handle two shapes for the same
+	// answer. An empty list is `[]`.
+	out := make([]onlineUser, 0, len(rows))
+	for _, u := range rows {
+		out = append(out, onlineUser{ID: u.ID, Username: u.Username})
 	}
-	writeJSON(w, http.StatusOK, presenceResponse{Online: names})
+	writeJSON(w, http.StatusOK, presenceResponse{Online: out})
 }

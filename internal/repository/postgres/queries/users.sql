@@ -15,7 +15,9 @@ WHERE username = $1;
 --
 -- ORDER BY username so the online list doesn't shuffle between refreshes, which
 -- would look like people joining and leaving when nothing changed.
--- name: ListUsernamesByIDs :many
-SELECT username FROM users
+-- Returns the id as well as the name, because the online list is now clickable:
+-- calling somebody needs their user id, and names are not identifiers.
+-- name: ListUsersByIDs :many
+SELECT id, username FROM users
 WHERE id = ANY($1::bigint[])
 ORDER BY username;
