@@ -155,6 +155,25 @@
     let pendingOffer = null;   // an incoming offer waiting for Accept
     let pendingIce = [];       // candidates that arrived before we had a remote description
     let onlineById = {};       // id -> username, so an incoming call has a name
+    let statsTimer = null;     // repeatedly samples the connection while a call is up
+    let rttSamples = [];       // every round-trip reading for this call
+
+    // Video is CONSTRAINED, not left to the camera's preference.
+    //
+    // Unconstrained, getUserMedia hands back whatever the camera likes — often
+    // 720p or 1080p at 30fps. A consumer uplink, and a mobile one especially,
+    // cannot carry that, so packets queue somewhere along the path. Queuing is
+    // what latency feels like. 640x360 at 24fps is a sane budget for a call
+    // between two ordinary connections.
+    //
+    // `ideal` rather than `exact` on purpose: exact makes getUserMedia FAIL on a
+    // camera that cannot hit the number, whereas ideal asks for the closest it
+    // can manage. A slightly wrong resolution beats no video at all.
+    const VIDEO_CONSTRAINTS = {
+      width: { ideal: 640 },
+      height: { ideal: 360 },
+      frameRate: { ideal: 24, max: 30 },
+    };
 
     // Reads the uid claim out of the JWT we are already holding.
     //
@@ -181,7 +200,7 @@
       // Browsers refuse this on plain http:// — localhost is the only exception.
       // That is why the two-real-networks test needs HTTPS.
       try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStream = await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS, audio: true });
       } catch (e) {
         // A camera that is missing, blocked, or already held by another
         // application should not mean no call at all — audio alone is still a
@@ -223,6 +242,10 @@
           // plain "connected" would overwrite the measurement moments after it
           // appeared. Observed exactly that on one side of the first call.
           reportPath(c);
+          // And keep sampling, so the line shows how the link behaves over the
+          // call rather than how it looked in its first half-second.
+          clearInterval(statsTimer);
+          statsTimer = setInterval(() => reportPath(c), 3000);
           return;
         }
         callStatus('connection: ' + c.connectionState);
@@ -248,12 +271,28 @@
         if (r.type === 'candidate-pair' && r.state === 'succeeded' && r.nominated) pair = r;
       });
       if (!pair) return;
+
       const local = stats.get(pair.localCandidateId);
       const remote = stats.get(pair.remoteCandidateId);
       const path = (local ? local.candidateType : '?') + ' <-> ' + (remote ? remote.candidateType : '?');
-      const rtt = pair.currentRoundTripTime;
-      callStatus('connected via ' + path + (rtt ? '  rtt ' + Math.round(rtt * 1000) + 'ms' : ''));
-      console.log('ICE path', path, 'rtt', rtt, pair);
+
+      // Round-trip time is SAMPLED REPEATEDLY, not read once.
+      //
+      // A single reading taken the instant the connection reports "connected" is
+      // close to meaningless: ICE has only just finished its checks and that
+      // first figure carries setup cost. Measured on one call it gave 47ms, and
+      // on the next 658ms — same devices, same networks. One sample cannot tell
+      // a bad link from a bad moment, so we keep them all and show the spread.
+      let line = 'via ' + path;
+      if (pair.currentRoundTripTime) {
+        rttSamples.push(Math.round(pair.currentRoundTripTime * 1000));
+        const last = rttSamples[rttSamples.length - 1];
+        const min = Math.min(...rttSamples);
+        const max = Math.max(...rttSamples);
+        line += '  rtt ' + last + 'ms  (min ' + min + ' / max ' + max + ', n=' + rttSamples.length + ')';
+      }
+      callStatus(line);
+      console.log('ICE', path, 'rtt', pair.currentRoundTripTime, pair);
     }
 
     async function startCall(otherId, otherName) {
@@ -360,6 +399,15 @@
     // people notice and are right to find alarming. Closing the RTCPeerConnection
     // does NOT release the devices — the tracks are ours, not its.
     function endCall() {
+      clearInterval(statsTimer);
+      statsTimer = null;
+      if (rttSamples.length) {
+        // Printed once at the end, because this is the actual result of the call
+        // and the status line is about to disappear with the call area.
+        console.log('call rtt summary (ms):', rttSamples,
+          'min', Math.min(...rttSamples), 'max', Math.max(...rttSamples));
+      }
+      rttSamples = [];
       if (pc) {
         pc.onicecandidate = null;
         pc.ontrack = null;
@@ -580,7 +628,12 @@
 
       // Open the WebSocket — token + room ride in the query string.
       let opened = false;
-      ws = new WebSocket(`ws://${location.host}/ws?token=${tok}&room=${room}`);
+      // Derive the socket scheme from the page's, never hardcode it. Over HTTPS a
+      // browser BLOCKS a plain ws:// connection as mixed content — the page loads
+      // fine and the socket silently never opens, which is a miserable thing to
+      // debug. https -> wss, http -> ws.
+      const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${wsScheme}//${location.host}/ws?token=${tok}&room=${room}`);
 
       ws.onopen = () => {
         opened = true;
