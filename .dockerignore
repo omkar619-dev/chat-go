@@ -4,3 +4,9 @@
 *.md
 /bin
 docker-compose.yml
+
+# Locally-built binaries. These are Windows/amd64 executables of the very
+# programs the image builds from source, so shipping them into the build
+# context is pure waste — tens of megabytes uploaded to the daemon on every
+# build, for files the Dockerfile then ignores.
+*.exe
