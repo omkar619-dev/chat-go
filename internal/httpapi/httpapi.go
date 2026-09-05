@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -28,6 +29,13 @@ type Handlers struct {
 	Producer  *broker.Producer
 	Embedder  *embed.Client // embeds search queries; only /search needs it
 	Generator *llm.Client   // streams "catch me up" summaries down the WebSocket
+
+	// WebRTC ICE, served to the browser by /ice-config. TurnSecret never leaves
+	// this process — only the short-lived credentials derived from it do.
+	StunURL    string
+	TurnURL    string
+	TurnSecret string
+	TurnTTL    time.Duration
 }
 
 // credentials is the JSON body for both /register and /login.

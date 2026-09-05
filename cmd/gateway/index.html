@@ -49,6 +49,7 @@
     .callbtn { background: #16a34a; padding: 0.1rem 0.4rem; font-size: 0.75em;
                margin-left: 0.25rem; vertical-align: middle; }
 
+    #relaytoggle { display: block; margin-bottom: 0.6rem; font-size: 0.82em; color: #6b7280; }
     /* Calling */
     #ringing { margin: 0.6rem 0; padding: 0.6rem 0.8rem; background: #fffbeb;
                border-left: 3px solid #f59e0b; border-radius: 4px; }
@@ -94,6 +95,11 @@
     <!-- Who's online. Filled from GET /rooms/{id}/presence, which reads Redis —
          so it shows people on the OTHER gateway too, not just this one. -->
     <div id="online"><span class="label">Online</span> <span id="onlinenames">—</span></div>
+
+    <!-- Forces every call through the TURN relay, so the relay path can be
+         tested and measured without needing a network hostile enough to make
+         a direct connection fail on its own. -->
+    <label id="relaytoggle"><input type="checkbox" id="forcerelay"> force relay (TURN only)</label>
 
     <!-- Somebody is calling us. Hidden until an offer arrives. -->
     <div id="ringing" hidden>
@@ -142,11 +148,30 @@
 
     // ── WebRTC calling ───────────────────────────────────────────────────────
     //
-    // STUN only, for now. A STUN server does one small thing: it tells a browser
-    // what its own public address looks like from the outside. It relays nothing,
-    // which is why public ones are free to use. TURN — an actual relay — comes
-    // later, once we have MEASURED how often a direct connection fails.
-    const ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+    // Where to find STUN and TURN comes FROM THE SERVER, at /ice-config.
+    //
+    // It used to be a constant here. The relay runs on demand on a cheap cloud
+    // instance and gets a new public address every time it starts, so hardcoding
+    // it meant editing this file and rebuilding the binary after every start.
+    //
+    // This value is only a fallback for the moment before the fetch lands — STUN
+    // alone, so a call attempted in that window still works on a friendly network.
+    let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+
+    async function refreshIceConfig() {
+      if (!token()) return;
+      try {
+        const res = await fetch('/ice-config', { headers: authHeader() });
+        if (!res.ok) return;
+        const cfg = await res.json();
+        if (cfg.iceServers && cfg.iceServers.length) {
+          iceServers = cfg.iceServers;
+          console.log('ice config', iceServers.map((s) => s.urls).flat());
+        }
+      } catch (e) {
+        // Keep the fallback. A call on a friendly network still works without it.
+      }
+    }
 
     let pc = null;             // the live connection, if there is one
     let localStream = null;    // our camera and microphone
@@ -156,6 +181,7 @@
     let pendingIce = [];       // candidates that arrived before we had a remote description
     let onlineById = {};       // id -> username, so an incoming call has a name
     let statsTimer = null;     // repeatedly samples the connection while a call is up
+    let connectTimer = null;   // gives up on a call that never establishes
     let rttSamples = [];       // every round-trip reading for this call
 
     // Video is CONSTRAINED, not left to the camera's preference.
@@ -218,16 +244,82 @@
       return localStream;
     }
 
+    // whyNot turns "it didn't connect" into a sentence that points at one thing.
+    //
+    // Relay-only has four distinct failures and they need four different fixes,
+    // but from the outside they are one symptom: a connection that sits on
+    // "connecting" until the timer fires. This used to report the first of them
+    // unconditionally, which cost me a debugging session — the message said no
+    // TURN server was configured while /ice-config was plainly serving one, and
+    // the real fault was a mistyped shared secret.
+    function whyNot(policy, relayCandidates, iceError) {
+      if (policy !== 'relay') return ' — no usable network path between you two';
+
+      // urls is a string OR an array per the spec, hence the concat.
+      const haveTurn = iceServers.some((s) =>
+        [].concat(s.urls).some((u) => u.indexOf('turn:') === 0));
+
+      if (!haveTurn) return ' — relay was forced, and no TURN server is configured';
+      if (iceError) return ' — the TURN server refused us (' + iceError + ')';
+      if (!relayCandidates) return ' — the TURN server never replied; check it is running and its port is open';
+      return ' — the relay gave us an address, but the two sides still could not reach each other';
+    }
+
     // newPeerConnection wires up the three things that matter: our candidates
     // going out, their media coming in, and the moment it connects or gives up.
     function newPeerConnection(otherId) {
-      const c = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      // iceTransportPolicy 'relay' makes the browser DISCARD every non-relay
+      // candidate — it pretends a direct path is impossible. That is how the TURN
+      // path gets tested deterministically from an ordinary desk, instead of
+      // hunting for a hostile enough network to trigger it naturally. It is also
+      // how the relay's latency cost gets measured against the direct figure.
+      const policy = document.getElementById('forcerelay').checked ? 'relay' : 'all';
+      if (policy === 'relay') console.log('forcing relay-only ICE');
+      const c = new RTCPeerConnection({ iceServers, iceTransportPolicy: policy });
+
+      // Per-connection evidence, filled in by the two handlers below and read
+      // by the give-up timer. Scoped to this connection rather than the page so
+      // a second call never inherits the first one's diagnosis.
+      let relayCandidates = 0;
+      let iceError = '';
+
+      // Give up after 20 seconds rather than sitting on "connecting…" forever.
+      //
+      // ICE has no reason to fail quickly — it waits out its own timers before
+      // declaring failure, which is well over half a minute of a call looking
+      // like it might still work. Worst case is relay-only with no TURN server
+      // configured: the browser gathers ZERO candidates, so there is nothing to
+      // try and nothing to time out, and the state never moves at all.
+      clearTimeout(connectTimer);
+      connectTimer = setTimeout(() => {
+        if (pc === c && c.connectionState !== 'connected') {
+          showError('call did not connect' + whyNot(policy, relayCandidates, iceError));
+          endCall();
+        }
+      }, 20000);
 
       // Trickle ICE: addresses are discovered over a second or two and sent as
       // each one appears, rather than waiting for the complete list. Waiting
       // would add that delay to the start of every call.
       c.onicecandidate = (e) => {
-        if (e.candidate) sendSignal(otherId, 'ice', e.candidate.toJSON());
+        if (!e.candidate) return;
+        // A 'relay' candidate is an address the TURN server allocated FOR us.
+        // Getting one is proof the relay was reached AND accepted our
+        // credential; getting none under relay-only policy is the whole
+        // failure, and is otherwise completely silent.
+        if (e.candidate.type === 'relay') relayCandidates++;
+        sendSignal(otherId, 'ice', e.candidate.toJSON());
+      };
+
+      // onicecandidateerror is the ONLY place the browser says why a server was
+      // unusable. 401 means the relay was reached and rejected our credential —
+      // a secret mismatch, not a network problem. Without this, "wrong secret"
+      // and "port blocked" look identical from the browser: both are just a
+      // connection that never leaves "connecting".
+      c.onicecandidateerror = (e) => {
+        if (!e.url || e.url.indexOf('turn:') !== 0) return; // STUN chatter, not ours
+        iceError = e.errorCode + (e.errorText ? ' ' + e.errorText : '');
+        console.warn('ICE server error', e.url, iceError);
       };
 
       c.ontrack = (e) => {
@@ -236,6 +328,7 @@
 
       c.onconnectionstatechange = () => {
         if (c.connectionState === 'connected') {
+          clearTimeout(connectTimer);   // it made it; stop the giving-up clock
           // Deliberately NOT writing a status line here first. reportPath is
           // about to write the ICE path, which is the number this whole phase
           // exists to produce — and this handler can fire more than once, so a
@@ -401,6 +494,8 @@
     function endCall() {
       clearInterval(statsTimer);
       statsTimer = null;
+      clearTimeout(connectTimer);
+      connectTimer = null;
       if (rttSamples.length) {
         // Printed once at the end, because this is the actual result of the call
         // and the status line is about to disappear with the call area.
@@ -645,6 +740,7 @@
         // room we just joined stops looking like one we haven't.
         refreshRooms();
         refreshPresence();
+        refreshIceConfig();   // before anyone can press a call button
         // A timer as well as the live nudges, because somebody TIMING OUT
         // produces no event at all — nobody announces their own crash. This is
         // what eventually removes them from the list.

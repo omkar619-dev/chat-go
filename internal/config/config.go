@@ -33,6 +33,15 @@ type Config struct {
 	BotQueue      int           // questions that may wait before new ones are shed
 	BotMaxAge     time.Duration // a question older than this when picked up is binned
 	BotRatePerMin int           // per-user mention budget
+
+	// WebRTC ICE. Served to the browser at /ice-config rather than baked into
+	// the page, because the TURN server runs ON DEMAND on a cheap cloud instance
+	// and gets a new public address every time it starts. A server address in
+	// the HTML would mean a rebuild after every start; here it is a restart.
+	StunURL    string        // always set; STUN only reports your public address
+	TurnURL    string        // e.g. turn:13.1.2.3:3478 — EMPTY means no relay configured
+	TurnSecret string        // shared with coturn's static-auth-secret; never sent to the browser
+	TurnTTL    time.Duration // how long a minted TURN credential stays valid
 }
 
 // Load reads config from environment variables, falling back to local-dev
@@ -84,6 +93,13 @@ func Load() Config {
 		BotQueue:      getenvInt("BOT_QUEUE", 8),
 		BotMaxAge:     getenvDuration("BOT_MAX_AGE", 90*time.Second),
 		BotRatePerMin: getenvInt("BOT_RATE_PER_MIN", 3),
+
+		// Google's public STUN. Safe to use free because STUN relays nothing — it
+		// only tells a browser what its own address looks like from outside.
+		StunURL:    getenv("STUN_URL", "stun:stun.l.google.com:19302"),
+		TurnURL:    getenv("TURN_URL", ""), // unset until the relay is running
+		TurnSecret: getenv("TURN_SECRET", ""),
+		TurnTTL:    getenvDuration("TURN_TTL", 12*time.Hour),
 	}
 }
 

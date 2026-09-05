@@ -98,6 +98,20 @@ func main() {
 		Producer:  producer,
 		Embedder:  embedder,
 		Generator: generator,
+
+		StunURL:    cfg.StunURL,
+		TurnURL:    cfg.TurnURL,
+		TurnSecret: cfg.TurnSecret,
+		TurnTTL:    cfg.TurnTTL,
+	}
+
+	// Say out loud whether a relay is configured. Without this, "calls fail on
+	// restrictive networks" and "TURN_URL was never set" look identical from the
+	// outside — and the second one is a five-second fix.
+	if cfg.TurnURL == "" {
+		log.Println("ice: STUN only, no TURN relay configured (set TURN_URL + TURN_SECRET)")
+	} else {
+		log.Printf("ice: STUN %s + TURN %s", cfg.StunURL, cfg.TurnURL)
 	}
 
 	// 5. Build the HTTP router with a couple of standard middlewares.
@@ -113,7 +127,8 @@ func main() {
 	})
 	r.Post("/register", h.Register)
 	r.Post("/login", h.Login)
-	r.With(h.RequireAuth).Get("/me", h.Me) // protected: needs a valid Bearer token
+	r.With(h.RequireAuth).Get("/me", h.Me)               // protected: needs a valid Bearer token
+	r.With(h.RequireAuth).Get("/ice-config", h.ICEConfig) // where to find STUN/TURN
 	r.Route("/rooms", func(pr chi.Router) {
 		pr.Use(h.RequireAuth) // every /rooms route requires a valid token
 		pr.Post("/", h.CreateRoom)
