@@ -28,15 +28,43 @@ Backing services: **Postgres + pgvector**, **Redis** (pub/sub + presence), **Kaf
 
 ## Build phases
 
-0. **Scaffold** — repo, schema, docker-compose (Postgres + Redis).  <- *you are here*
-1. **Text chat MVP** — WS gateway + auth + send/receive via Redis pub/sub + HTMX UI (no Kafka yet).
-2. **Durability + Kafka** — produce to Kafka, `persister` -> Postgres, load history.
-3. **Semantic search** — `indexer` (embed -> pgvector) + search.
-4. **RAG assistant** — `@bot` retrieve + LLM + stream.
-5. **"Catch me up"** summarization.
-6. **Presence + multi-gateway scaling** (Redis TTL heartbeats).
-7. **WebRTC** voice/video (signaling + STUN/TURN).
-8. **Deploy** on k3s (Helm) + tests + CI.
+0. ✅ **Scaffold** — repo, schema, docker-compose (Postgres + Redis).
+1. ✅ **Text chat MVP** — WS gateway + auth + send/receive via Redis pub/sub + HTMX UI (no Kafka yet).
+2. ✅ **Durability + Kafka** — produce to Kafka, `persister` -> Postgres, load history.
+3. ✅ **Semantic search** — `indexer` (embed -> pgvector) + search.
+4. ✅ **RAG assistant** — `@bot` retrieve + LLM + stream.
+5. ✅ **"Catch me up"** summarization.
+6. ✅ **Presence + multi-gateway scaling** — Redis heartbeats, two gateways behind nginx, load shedding.
+7. ✅ **WebRTC** voice/video — signalling over the existing socket, STUN + coturn TURN.
+8. **Deploy** on k3s (Helm) + tests + CI.  <- *you are here*
+
+Known gaps are tracked in [docs/HARDENING.md](docs/HARDENING.md) rather than left
+implied — four blockers remain open, and they gate public exposure, not the build.
+
+## Measured, not assumed
+
+**Redis fan-out.** The gateway originally opened one Redis subscription per
+WebSocket connection, so a room with 500 members meant 500 subscriptions all
+receiving identical bytes. It is now one subscription per room per gateway
+process, fanned out in memory. Measured with `PUBSUB NUMSUB` and
+`total_net_output_bytes` across a 100/500/1000/2000-connection ladder
+(`cmd/loadtest`), before and after.
+
+**Slow readers.** A socket that stops reading gets a bounded queue, then a
+disconnect — not an unbounded buffer. Verified by stalling one client
+deliberately and watching it get evicted while the others kept up.
+
+**WebRTC paths**, from `RTCPeerConnection.getStats()`:
+
+| Path | Result |
+|---|---|
+| Direct, two real networks (laptop on WiFi + phone on mobile data) | `srflx <-> srflx`, RTT 63ms (min 35 / max 841, n=25) |
+| Relayed via coturn in `ap-south-1`, forced with `iceTransportPolicy: 'relay'` | `relay <-> relay`, RTT 92ms (min 20, n=2) |
+
+These two numbers are **not yet a fair comparison** — the direct figure is two
+devices on two networks, the relayed one is two browsers on a single host. The
+honest version needs the same pair measured twice with only the relay toggled,
+and is still to do.
 
 ## Local dev
 
