@@ -1,0 +1,136 @@
+# Values for chat-go.
+#
+# The templates describe the SHAPE of the deployment. This file holds the parts
+# that differ between a throwaway k3d cluster on a laptop and the homelab —
+# image tags, sizes, addresses. Same split as internal/config: code decides the
+# structure, environment decides the numbers.
+
+# The image built by the repo's Dockerfile. It contains all four processes;
+# each Deployment picks one with its command.
+image:
+  repository: chat-go
+  tag: dev
+  # IfNotPresent, because in k3d the image is side-loaded with
+  # `k3d image import` rather than pulled. Always would send the kubelet
+  # looking on Docker Hub for an image that exists only on this laptop, and
+  # the pod would sit in ErrImagePull with a very confusing message.
+  pullPolicy: IfNotPresent
+
+# The JWT signing key. NO DEFAULT, and the chart refuses to render without it —
+# deliberately mirroring config.RequireJWTSecret in the application.
+#
+# The gateway already refuses to start on a placeholder, because the old
+# fail-open default was invisible: every instance fell back to the same string,
+# logins worked, and tokens minted by one replica validated on another while a
+# value from a public repository signed everything. A chart that quietly
+# generated a secret would restore exactly that failure at a different layer.
+#
+# Set it in a gitignored values file, never here:
+#   deploy/helm/chat-go/secrets.values.yaml
+jwtSecret: ""
+
+gateway:
+  # Two replicas, which is the arrangement phase 6.1 proved works: a JWT is
+  # verified by recomputing its signature rather than looked up in a session
+  # store, so any replica can serve any request and no sticky sessions are
+  # needed.
+  replicas: 2
+  port: 8090
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+# Ollama runs outside the cluster, on the homelab. Reached by IP because it is
+# not a Kubernetes Service — nothing here manages it, and that is fine: it is a
+# dependency the system degrades around rather than one it needs to start.
+ollama:
+  url: http://192.168.29.30:11434
+  embedModel: all-minilm
+  chatModel: qwen2.5:1.5b
+
+# How far one slow socket may fall behind before the hub disconnects it.
+hubBuffer: 64
+
+# WebRTC ICE. turn.url empty means STUN only — calls still work between
+# permissive networks and fail on restrictive ones, which is the honest state
+# when the relay is not running. The relay is on-demand and gets a new address
+# every start, which is exactly why this is config and not baked into the page.
+turn:
+  stunURL: stun:stun.l.google.com:19302
+  url: ""
+  secret: ""
+
+postgres:
+  image: pgvector/pgvector:0.7.4-pg16
+  # These credentials are the local-dev pair, sitting in plain text exactly as
+  # long as it takes to get the first install green. Blocker B5 in
+  # docs/HARDENING.md moves them into a SealedSecret — which is the next step.
+  user: chat
+  password: chat_dev
+  database: chat
+  storage: 2Gi
+  # Empty means "whatever the cluster calls default" — local-path on both k3d
+  # and k3s, which is a directory on the node. Correct for a single replica
+  # that never moves; it would be wrong for anything expected to reschedule
+  # onto another node, because the data does not follow.
+  storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # Memory has a limit, CPU deliberately does not.
+      #
+      # Exceeding a memory limit gets the process killed, so a limit is the
+      # only thing stopping one container from taking down the node. CPU is
+      # different: a CPU limit does not protect anything, it just throttles —
+      # the kernel stops handing out slices even when the machine is idle. On
+      # a Core 2 Duo that turns a slow query into a stalled one. Requests
+      # already guarantee a share under contention, which is the part that
+      # matters.
+      memory: 512Mi
+
+redis:
+  image: redis:7-alpine
+  # No storage key, and no PVC — deliberately.
+  #
+  # Everything chat-go keeps in Redis is designed to survive losing Redis.
+  # Pub/sub is transient by definition. Presence is a sorted set scored by
+  # last-seen time that goes stale after 45 seconds on its own, so a wipe costs
+  # one heartbeat of everyone looking offline. Bot rate limits live in
+  # minute-bucketed keys that expire themselves.
+  #
+  # Nothing here outlives a restart by design, so persisting it would be
+  # ceremony: a PVC to provision, a StatefulSet to manage, and a disk to size,
+  # protecting data whose loss is already handled. The durable plane is Kafka
+  # and Postgres, and keeping that boundary sharp is the point.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+kafka:
+  image: apache/kafka:3.9.0
+  storage: 4Gi
+  storageClass: ""
+  # Kafka is a JVM, and a JVM with no heap ceiling sizes itself from the
+  # machine's total RAM — which on an 8GB homelab node means it helps itself to
+  # roughly a quarter of the box and then competes with the workloads it exists
+  # to serve. Xms == Xmx so the heap is claimed once at startup rather than
+  # grown under load, which is when a resize hurts most.
+  heapOpts: "-Xmx512M -Xms512M"
+  resources:
+    requests:
+      cpu: 200m
+      memory: 768Mi
+    limits:
+      # Comfortably above the 512M heap: a JVM's footprint is the heap PLUS
+      # metaspace, thread stacks, code cache and direct byte buffers — and
+      # Kafka leans on direct buffers hard. Sizing a container limit to the
+      # heap alone is a reliable way to get OOMKilled with plenty of heap free.
+      memory: 1280Mi

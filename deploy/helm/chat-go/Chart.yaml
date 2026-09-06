@@ -1,0 +1,18 @@
+apiVersion: v2
+name: chat-go
+description: >-
+  Real-time chat in Go — WebSocket gateway, Kafka as the durable log,
+  Redis for fan-out and presence, Postgres/pgvector for history and search.
+type: application
+
+# Two versions, and they move independently.
+#
+# version    = this CHART's version. Bumped when the templates change, even if
+#              the application does not — a fixed probe is a chart release.
+# appVersion = the version of chat-go the chart installs by default. Bumped
+#              when the image changes, even if no template does.
+#
+# Conflating them is the common mistake: you then cannot ship a manifest fix
+# without implying the application changed, or vice versa.
+version: 0.1.0
+appVersion: "0.1.0"

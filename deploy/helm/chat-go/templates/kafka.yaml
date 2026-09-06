@@ -1,0 +1,162 @@
+{{/*
+Kafka: the durable, replayable message log. Single-node KRaft — this one broker
+is both the controller (cluster metadata) and the broker (the data), which is
+why ZooKeeper is absent.
+
+A StatefulSet, and here the disk really is the point. Postgres and the search
+index are both PROJECTIONS of this log: either can be dropped and rebuilt by
+replaying it. Lose the log and that stops being true.
+
+Only ONE listener, unlike docker-compose. The compose file needs a second,
+EXTERNAL listener because the Go processes run on the Windows host, outside
+Docker's network. In the cluster every client is a pod on the same network, so
+the host-facing listener — and the whole 127.0.0.1-vs-localhost problem that
+came with it — simply does not exist here.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chat-go.fullname" . }}-kafka
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "kafka") | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+  selector:
+    {{- include "chat-go.selectorLabels" (dict "root" $ "component" "kafka") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "chat-go.fullname" . }}-kafka
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "kafka") | nindent 4 }}
+spec:
+  serviceName: {{ include "chat-go.fullname" . }}-kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "kafka") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "kafka") | nindent 8 }}
+    spec:
+      # The apache/kafka image runs as uid 1000, but a freshly provisioned
+      # volume is owned by root — so without this Kafka crashloops on its first
+      # write to the log directory. fsGroup tells the kubelet to chown the
+      # volume to that group before the container starts.
+      #
+      # If this pod ever crashloops with a permissions error on
+      # /var/lib/kafka/data, this is the line to look at first.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: kafka
+          image: {{ .Values.kafka.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            # One process wearing both hats. In a real cluster these are
+            # separate roles on separate machines.
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            # localhost, because the only voter in this quorum is this process
+            # talking to itself. With more than one node these would be the
+            # per-pod DNS names the headless Service provides.
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: 1@localhost:9093
+            - name: KAFKA_LISTENERS
+              value: PLAINTEXT://:9092,CONTROLLER://:9093
+            # The address a client is TOLD to use after it bootstraps. Getting
+            # this wrong is the classic Kafka failure: the connection succeeds,
+            # the broker replies "actually I live at <unreachable>", and every
+            # subsequent request goes nowhere. It must be a name that resolves
+            # from inside the client's network, which is this Service.
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: PLAINTEXT://{{ include "chat-go.fullname" . }}-kafka:9092
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+            # WITHOUT THIS THE VOLUME BELOW IS DECORATIVE. The image defaults
+            # log.dirs to /tmp/kafka-logs, inside the container's writable
+            # layer, so every restart would silently discard the entire message
+            # log and all consumer offsets. That exact mistake cost the whole
+            # chat.messages topic once on 2026-08-09, to an unrelated one-line
+            # config change — see the same comment in docker-compose.yml.
+            - name: KAFKA_LOG_DIRS
+              value: /var/lib/kafka/data
+            # One broker cannot replicate to anyone, so the internal topics
+            # must ask for a single copy. Left at their default of 3 the broker
+            # refuses to create them and consumer groups never form.
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            # Default is 3000ms of deliberate delay so a starting cluster can
+            # batch its joiners into one rebalance. With four consumer groups
+            # of one member each, that is three seconds of waiting to optimise
+            # a stampede that cannot happen.
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.kafka.heapOpts | quote }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          # A startup probe, then liveness. Kafka boots slowly — JVM, then log
+          # recovery proportional to how much is on disk — and on the homelab's
+          # CPU that is minutes, not seconds. Without this, liveness would start
+          # failing during a normal start and kill the broker before it ever
+          # finished, forever.
+          #
+          # This is the general shape for anything slow to start: a generous
+          # startupProbe to cover the boot, then a tight livenessProbe once it
+          # is up. Encoding "it might just be starting" into the liveness delay
+          # instead gives you a probe that is too slow to detect a real hang.
+          startupProbe:
+            tcpSocket:
+              port: kafka
+            periodSeconds: 5
+            failureThreshold: 60   # up to 5 minutes to come up
+          livenessProbe:
+            tcpSocket:
+              port: kafka
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            # TCP rather than an exec probe. The obvious check —
+            # kafka-broker-api-versions.sh — starts a fresh JVM on every probe,
+            # which on a Core 2 Duo costs more than the thing it is measuring.
+            # An accepted connection on the broker port is a weaker signal, and
+            # the honest one to pay for here.
+            tcpSocket:
+              port: kafka
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.kafka.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.kafka.storage }}
+        {{- if .Values.kafka.storageClass }}
+        storageClassName: {{ .Values.kafka.storageClass }}
+        {{- end }}

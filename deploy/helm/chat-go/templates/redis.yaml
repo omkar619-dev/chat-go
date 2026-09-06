@@ -1,0 +1,95 @@
+{{/*
+Redis: pub/sub fan-out between gateways, presence, and the bot's rate-limit
+counters.
+
+A DEPLOYMENT, not a StatefulSet — the one backing service here that owns no
+disk. See the reasoning in values.yaml: everything chat-go stores in Redis is
+already designed to survive Redis disappearing, so persisting it would add a
+PVC, a StatefulSet and a disk to size in exchange for protecting data whose
+loss is a non-event.
+
+Which also keeps the architectural boundary honest. Kafka and Postgres are the
+durable plane; Redis is a delivery accelerator. A Redis with a disk quietly
+invites someone to start treating it as a database.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chat-go.fullname" . }}-redis
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "redis") | nindent 4 }}
+spec:
+  # An ordinary ClusterIP, unlike Postgres. Nothing needs per-pod DNS here, and
+  # a virtual IP means the name resolves even while the pod is restarting —
+  # clients then get a refused connection rather than a vanished hostname,
+  # which is a far clearer failure to read in a log.
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+  selector:
+    {{- include "chat-go.selectorLabels" (dict "root" $ "component" "redis") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chat-go.fullname" . }}-redis
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "redis") | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. Two Redis instances briefly serving the same
+  # Service would split the pub/sub bus: a message published to one is not seen
+  # by subscribers on the other, and messages would silently fail to reach half
+  # the room for the length of the rollout. A moment of downtime is the honest
+  # trade — the gateways already report a failed publish rather than swallowing
+  # it, so the cost is visible and bounded.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "redis") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "redis") | nindent 8 }}
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No --appendonly. The compose file enables AOF because a dev volume
+          # was already there; here there is no volume to append to, and asking
+          # Redis to fsync a log into an emptyDir would cost writes to buy
+          # durability that ends when the pod does.
+          args:
+            - redis-server
+            - --save
+            - ""
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+      volumes:
+        # emptyDir: a directory created when the pod starts and deleted when it
+        # stops. Redis writes nothing it needs later, but it does want /data to
+        # exist and be writable.
+        - name: data
+          emptyDir: {}

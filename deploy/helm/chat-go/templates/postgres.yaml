@@ -1,0 +1,115 @@
+{{/*
+Postgres + pgvector: message history, room membership, read watermarks, and
+the embedding index behind semantic search.
+
+A StatefulSet rather than a Deployment because this pod owns a disk. A
+Deployment treats its pods as interchangeable and will happily start a
+replacement before the old one is gone; two Postgres processes opening the
+same data directory is how you corrupt a database. A StatefulSet gives a
+stable name, a stable volume, and at-most-one semantics for each ordinal.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chat-go.fullname" . }}-postgres
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "postgres") | nindent 4 }}
+spec:
+  # Headless. DNS for this name returns the pod's own IP instead of a virtual
+  # IP that load-balances across pods — which is what a StatefulSet's
+  # serviceName expects, and what gives its pods stable per-pod DNS names.
+  # With one replica the practical difference is nil; the semantics are still
+  # the honest ones for a database.
+  clusterIP: None
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+  selector:
+    {{- include "chat-go.selectorLabels" (dict "root" $ "component" "postgres") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "chat-go.fullname" . }}-postgres
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "postgres") | nindent 4 }}
+spec:
+  serviceName: {{ include "chat-go.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "postgres") | nindent 8 }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user | quote }}
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgres.password | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database | quote }}
+            # initdb refuses to initialise a directory that is not empty, and a
+            # freshly mounted volume frequently is not — ext4 creates lost+found
+            # at the root of every filesystem. Pointing PGDATA at a SUBDIRECTORY
+            # of the mount avoids the whole argument. Costs nothing, and the
+            # failure it prevents is an opaque one-line initdb error.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Readiness gates TRAFFIC: fail it and the Service stops sending
+          # connections here. pg_isready asks the server whether it will accept
+          # a connection, which is exactly the question being asked.
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - {{ .Values.postgres.user | quote }}
+                - -d
+                - {{ .Values.postgres.database | quote }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          # Liveness gates LIFE: fail it and the container is killed. So it is
+          # deliberately a weaker test than readiness. Postgres replaying WAL
+          # after an unclean shutdown refuses connections for as long as
+          # recovery takes — pg_isready fails throughout. Used as a liveness
+          # probe that would kill the server mid-recovery, and again on the
+          # restart, forever. A TCP check asks the only question worth asking
+          # here: is the process still there at all.
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+  # A volumeClaimTemplate, not a plain volume: the StatefulSet creates one PVC
+  # per pod and RE-ATTACHES it by name on restart. Deliberately NOT deleted
+  # when the release is uninstalled — `helm uninstall` leaves these behind, so
+  # a mistaken uninstall costs downtime rather than the message history.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+        {{- if .Values.postgres.storageClass }}
+        storageClassName: {{ .Values.postgres.storageClass }}
+        {{- end }}

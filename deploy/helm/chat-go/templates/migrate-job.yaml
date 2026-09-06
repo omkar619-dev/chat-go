@@ -1,0 +1,72 @@
+{{/*
+Applies the schema, once per install or upgrade.
+
+A Helm HOOK rather than an ordinary Job. An ordinary Job would be created on
+install and then never run again, because a Job's pod template is immutable —
+the second `helm upgrade` would fail on an attempt to modify it. A hook is
+managed outside the release's normal lifecycle, so it can be deleted and
+recreated on every run.
+
+POST-install, not pre-install. A pre-install hook runs before any of the
+chart's own resources exist, so there would be no Postgres to migrate. Helm
+does not wait for Postgres to be READY before running post-install hooks
+either, which is why cmd/migrate retries rather than assuming.
+
+Known limitation, stated rather than hidden: on `helm upgrade` the new
+application pods can start before this Job has run. That is survivable here
+because the schema is purely additive and every statement is IF NOT EXISTS. It
+would NOT be survivable for a migration that drops or renames a column — the
+answer there is expand/contract, where every change is compatible with both
+the old and the new code, not tighter ordering.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "chat-go.fullname" . }}-migrate
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # Lower weights run first. Nothing else is a hook yet; this reserves the
+    # order for when something is, because a hook added later would otherwise
+    # sort arbitrarily against this one.
+    "helm.sh/hook-weight": "-5"
+    # Delete the PREVIOUS run's Job just before creating this one. Without it,
+    # the second upgrade fails with "job already exists".
+    #
+    # Deliberately NOT hook-succeeded: that deletes the Job the moment it
+    # passes, taking its logs with it. Keeping the completed Job around means
+    # `kubectl logs job/chat-go-migrate` still answers "what did the last
+    # migration actually do" — which is worth far more than a tidy pod list.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # Four tries total. The schema is idempotent, so a retry is always safe, and
+  # the usual cause of failure is Postgres being slower to start than expected.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "migrate") | nindent 8 }}
+    spec:
+      # Never, not OnFailure. OnFailure restarts the container inside the SAME
+      # pod, and each restart overwrites the previous logs — so a migration
+      # that fails four times leaves you the fourth message and no history.
+      # Never creates a fresh pod per attempt, and every failed pod keeps its
+      # own logs.
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Same image as every other process in this chart; the command picks
+          # which of the five binaries runs.
+          command: ["/app/migrate"]
+          env:
+            - name: DATABASE_URL
+              value: {{ include "chat-go.databaseURL" . | quote }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
