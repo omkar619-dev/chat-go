@@ -2,6 +2,16 @@
 .env
 *.pem
 
+# Helm value overrides holding real secrets. The chart refuses to render
+# without a jwtSecret, so this file has to exist locally — which makes it
+# exactly the kind of thing that gets committed by a reflexive `git add -A`.
+secrets.values.yaml
+**/secrets.values.yaml
+
+# Plaintext Secret manifests on their way into kubeseal. The sealed OUTPUT is
+# meant to be committed; the input never is.
+*.tmp.yaml
+
 # build artifacts
 /bin/
 *.exe

@@ -1,0 +1,82 @@
+{{/*
+Configuration shared by all four processes.
+
+Split in two along ONE line: could this value be printed in a log, a bug report
+or a screenshot without consequence? Broker addresses and model names, yes —
+ConfigMap. Anything that grants access, no — Secret.
+
+The split is not about how Kubernetes stores them; a Secret is base64, not
+encryption, and anyone who can read Secrets in this namespace can read these.
+It is about blast radius everywhere else: ConfigMaps are printed in `describe`
+output, copied into issues and pasted into chats, and Secrets are the things
+people have learned to redact.
+
+Every Deployment pulls both wholesale with envFrom, so a process gets settings
+it does not use — the persister never reads STUN_URL. That is intentional. The
+alternative is four hand-curated lists that drift, and a component that lost an
+environment variable it silently needed. config.Load() ignores what it does not
+ask for.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chat-go.fullname" . }}-config
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "config") | nindent 4 }}
+data:
+  # In-cluster addresses. Note these are the standard ports, not the 5433/6381/
+  # 9094 offsets used locally — those exist only to avoid colliding with
+  # news-feed-go on the laptop, and nothing collides inside a namespace.
+  REDIS_ADDR: "{{ include "chat-go.fullname" . }}-redis:6379"
+  KAFKA_BROKER: "{{ include "chat-go.fullname" . }}-kafka:9092"
+  KAFKA_TOPIC: "chat.messages"
+
+  OLLAMA_URL: {{ .Values.ollama.url | quote }}
+  # Changing EMBED_MODEL is not a config change but a migration: all-minilm
+  # emits 384 numbers, matching vector(384) in schema.sql, so a different model
+  # means altering that column AND re-indexing every message. CHAT_MODEL is
+  # cheap to swap by comparison — nothing stored depends on it.
+  EMBED_MODEL: {{ .Values.ollama.embedModel | quote }}
+  CHAT_MODEL: {{ .Values.ollama.chatModel | quote }}
+
+  HUB_BUFFER: {{ .Values.hubBuffer | quote }}
+
+  BOT_WORKERS: {{ .Values.bot.workers | quote }}
+  BOT_QUEUE: {{ .Values.bot.queue | quote }}
+  BOT_MAX_AGE: {{ .Values.bot.maxAge | quote }}
+  BOT_RATE_PER_MIN: {{ .Values.bot.ratePerMin | quote }}
+
+  STUN_URL: {{ .Values.turn.stunURL | quote }}
+  TURN_URL: {{ .Values.turn.url | quote }}
+{{/*
+The secret half. Everything here either grants database access or signs tokens.
+
+Rendered only when secrets.create is true. With it false, an object of the same
+name is expected to already exist in the namespace — put there by a
+SealedSecret, which is encrypted with one specific cluster's public key and can
+therefore be committed to a public repository and decrypted by nothing else.
+
+Note what does NOT change when that happens: every Deployment still does
+`secretRef: <fullname>-secrets`. The workloads never learn where the bytes came
+from, which is exactly why the swap is a values flag and not a rewrite.
+*/}}
+{{- if .Values.secrets.create }}
+---
+{{- if not .Values.jwtSecret }}
+{{- fail "\n\njwtSecret is required and has no default.\n\nGenerate one and keep it out of git:\n  openssl rand -hex 32\n  # write it to deploy/helm/chat-go/secrets.values.yaml as: jwtSecret: \"<value>\"\n  helm upgrade chat-go deploy/helm/chat-go -f deploy/helm/chat-go/secrets.values.yaml\n\nThe gateway refuses to start on a placeholder key, and a chart that generated\none silently would reintroduce the same fail-open hole one layer down.\n" }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "chat-go.fullname" . }}-secrets
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "config") | nindent 4 }}
+type: Opaque
+stringData:
+  # stringData rather than data: Kubernetes base64-encodes these on the way in,
+  # so the template stays readable and there is no chance of committing a value
+  # that is encoded just enough to look handled.
+  DATABASE_URL: {{ include "chat-go.databaseURL" . | quote }}
+  JWT_SECRET: {{ .Values.jwtSecret | quote }}
+  TURN_SECRET: {{ .Values.turn.secret | quote }}
+{{- end }}

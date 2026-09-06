@@ -29,6 +29,20 @@ image:
 #   deploy/helm/chat-go/secrets.values.yaml
 jwtSecret: ""
 
+secrets:
+  # true  — the chart renders a plain Secret from the values in this file. Fine
+  #         for a throwaway cluster; the values are on disk in clear text and
+  #         the rendered manifest holds them in base64, which is encoding, not
+  #         encryption.
+  # false — something OUTSIDE the chart supplies <fullname>-secrets. That is
+  #         how this reaches the homelab: a SealedSecret, encrypted with the
+  #         target cluster's public key, safe to commit to a public repo,
+  #         decryptable only by the controller running in that one cluster.
+  #
+  # With false the chart stops requiring jwtSecret, because it no longer
+  # produces the Secret that would need it.
+  create: true
+
 gateway:
   # Two replicas, which is the arrangement phase 6.1 proved works: a JWT is
   # verified by recomputing its signature rather than looked up in a session
@@ -42,6 +56,43 @@ gateway:
       memory: 64Mi
     limits:
       memory: 256Mi
+
+# The three Kafka consumers. Same image as the gateway, same configuration,
+# different command — which is the whole reason they can share one image.
+#
+# REPLICAS ARE CAPPED BY PARTITIONS, NOT BY THIS NUMBER. Within a consumer
+# group Kafka assigns each partition to exactly one member, so with a
+# single-partition chat.messages topic a second replica of any of these gets no
+# partitions and sits idle: not faster, just running. Raising these only helps
+# after the topic is repartitioned — and repartitioning changes which room
+# lands where, so per-room ordering only survives it because the key is
+# room_id. Left at 1 deliberately.
+consumers:
+  persister:
+    replicas: 1
+    resources:
+      requests: {cpu: 50m, memory: 32Mi}
+      limits: {memory: 128Mi}
+  indexer:
+    replicas: 1
+    resources:
+      requests: {cpu: 50m, memory: 32Mi}
+      limits: {memory: 128Mi}
+  bot:
+    replicas: 1
+    resources:
+      requests: {cpu: 50m, memory: 32Mi}
+      limits: {memory: 128Mi}
+
+# Bot load shedding. Env-tunable rather than baked in precisely because these
+# paths only run under pressure — proving they work means making the limits
+# absurd on purpose, and editing constants to do that is how a test value ends
+# up in production.
+bot:
+  workers: 2
+  queue: 8
+  maxAge: 90s
+  ratePerMin: 3
 
 # Ollama runs outside the cluster, on the homelab. Reached by IP because it is
 # not a Kubernetes Service — nothing here manages it, and that is fine: it is a

@@ -88,14 +88,41 @@ plaintext. On any shared network this is a trivial capture.
 setup), serve `https://`, and have the client derive the socket scheme rather than
 hardcoding it: `location.protocol === 'https:' ? 'wss:' : 'ws:'`.
 
-### B5. Infrastructure credentials are hardcoded
+### ~~B5. Infrastructure credentials are hardcoded~~ — ✅ FIXED 2026-09-06 (deploy path)
 `docker-compose.yml` contains `chat:chat_dev` for Postgres; the connection string with
 those credentials is a default in `config.go`.
 
 **Why it's dangerous:** dev credentials tend to survive into the first deploy.
 
-**Fix:** real generated secrets, delivered via **Sealed Secrets** (already in use for
-newsfeed on the k3s cluster). No credential in the repo, no credential in a Helm values file.
+**Fixed for anything deployed.** The Helm chart's `secrets.create=false` makes it consume a
+`<release>-secrets` Secret it does not create, supplied by a **SealedSecret** — encrypted
+with the target cluster's public key, so the ciphertext is safe in a public repo and only
+that cluster's controller can open it. Verified on k3d: the live Secret carries
+`ownerReferences[0].kind: SealedSecret`, which is the proof it came from the decrypted blob
+rather than from a values file. Sealed output lives in `deploy/sealed/<cluster>.yaml`, named
+for the cluster because it is only valid there.
+
+`jwtSecret` additionally has **no default and the chart calls `fail`** without it, mirroring
+`config.RequireJWTSecret`. A chart that quietly generated a key would have reintroduced the
+same fail-open hole one layer down.
+
+**Two things this deliberately does NOT fix:**
+
+1. The compose defaults are untouched. That is the local-dev path, it never leaves the
+   laptop, and wrapping it in ceremony would make the real credentials look equally routine.
+2. A Secret is base64, not encryption — anyone who can read Secrets in the namespace can
+   read these. What Sealed Secrets buys is that the credential is not in **git**, which is a
+   different threat and the one that actually leaks. Restricting who can read Secrets in the
+   cluster is RBAC's job and is still open.
+
+**Ordering constraint, learned by breaking it:** once the chart stops creating the Secret,
+the Secret must exist *before* the chart is applied — and Helm cannot express that, because
+the dependency is no longer Helm's. `helm upgrade` deletes what it no longer renders and
+*then* runs post-upgrade hooks, so the migrate Job died on a missing `envFrom` and the
+upgrade timed out. Recovering took `--no-hooks` to record the removal while the Secret was
+already absent, then applying the SealedSecret. On the homelab this is handled the way
+newsfeed already is: a **multi-source ArgoCD Application** — chart from one repo, SealedSecret
+from the GitOps repo — reconciled until both agree.
 
 ---
 

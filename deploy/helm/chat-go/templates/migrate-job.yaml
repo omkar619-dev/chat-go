@@ -61,9 +61,13 @@ spec:
           # Same image as every other process in this chart; the command picks
           # which of the five binaries runs.
           command: ["/app/migrate"]
-          env:
-            - name: DATABASE_URL
-              value: {{ include "chat-go.databaseURL" . | quote }}
+          # The same Secret the application reads, rather than a second copy of
+          # the connection string. A migration that connects differently from
+          # the app it migrates for is a migration that can succeed against the
+          # wrong database.
+          envFrom:
+            - secretRef:
+                name: {{ include "chat-go.fullname" . }}-secrets
           resources:
             requests:
               cpu: 50m

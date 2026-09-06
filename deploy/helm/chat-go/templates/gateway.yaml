@@ -1,0 +1,98 @@
+{{/*
+The gateway: HTTP + WebSocket, auth, the UI, WebRTC signalling.
+
+The only one of the four processes that serves traffic, and the only one with
+more than one replica. That works because a JWT is verified by RECOMPUTING its
+signature rather than by looking up a session, so any replica can serve any
+request — which is what phase 6.1 demonstrated with nginx in front of two
+processes, and why no sticky sessions are needed here either.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chat-go.fullname" . }}-gateway
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.gateway.port }}
+      targetPort: http
+  selector:
+    {{- include "chat-go.selectorLabels" (dict "root" $ "component" "gateway") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chat-go.fullname" . }}-gateway
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "gateway") | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "gateway") | nindent 8 }}
+      annotations:
+        # Roll the pods when configuration changes.
+        #
+        # Kubernetes does NOT restart anything when a ConfigMap or Secret is
+        # edited — values injected with envFrom are read once at process start,
+        # so an updated ConfigMap leaves every running pod on the old values
+        # with nothing to indicate it. Hashing the rendered content into an
+        # annotation changes the pod template whenever the config changes,
+        # which is what makes a rollout happen.
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/gateway"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.gateway.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "chat-go.fullname" . }}-config
+            - secretRef:
+                name: {{ include "chat-go.fullname" . }}-secrets
+          # /healthz answers "this process is up" and nothing more — it does not
+          # check Postgres, Redis or Kafka, and should not.
+          #
+          # A readiness probe that fails when a dependency is down takes the
+          # gateway out of service the moment Redis hiccups, so nobody can
+          # connect at all. But the gateway ALREADY handles those failures
+          # deliberately: the four-outcome dual write tells the user "saved, not
+          # delivered live" or "delivered, not saved". Removing the pod from the
+          # Service replaces a degraded, honest system with an unreachable one.
+          #
+          # Dependency health belongs in metrics and alerts, not in a probe
+          # whose only available action is to stop serving.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+      # Known consequence, worth stating rather than discovering: a rollout
+      # drops every WebSocket on the replaced pod. Browsers do not reconnect —
+      # ws.onclose does nothing once a session has opened (a gap noted in phase
+      # 6.2) — so a deploy silently freezes every open tab until someone
+      # refreshes. Jittered auto-reconnect is the real fix, and it has to be
+      # jittered: 2000 clients reconnecting at once is the accept-queue
+      # overflow already measured in the load tests.
+      terminationGracePeriodSeconds: 30

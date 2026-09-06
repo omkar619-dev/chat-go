@@ -1,0 +1,76 @@
+{{/*
+The three Kafka consumers: persister, indexer, bot.
+
+Generated from a loop rather than written out three times, because they really
+are the same object — same image, same configuration, no Service, no HTTP
+probes, one replica. The only thing that differs is which binary runs. Three
+near-identical files would drift the moment one of them got a fix.
+
+They are three SEPARATE consumer groups reading the same topic, which is the
+point of choosing a log over a queue: each gets every message, independently,
+and adding the indexer in phase 3 required no change to the gateway or the
+persister. A queue would have had them competing for messages.
+
+Each also has a DIFFERENT reliability contract, chosen per consumer rather than
+inherited:
+  persister — retries in place forever, never advances past a failure. Losing a
+              message means losing history.
+  indexer   — same, since an unindexed message is invisible to search.
+  bot       — commits whether or not it answered, and never retries. A bot
+              retrying a dead model would jam its partition; a missed reply is
+              an annoyance.
+
+NO PROBES HERE, and that is a real gap rather than an omission. These processes
+have no port to probe, and "is the process running" is the question Kubernetes
+already answers. The question that matters is CONSUMER LAG — which catches both
+a dead consumer and a merely slow one — and nothing here measures it. That is
+H5 in docs/HARDENING.md: the persister was down for hours once and nothing
+noticed, surfacing much later as "my messages disappear when I switch rooms".
+A liveness probe would not have caught it either, because the process was fine.
+*/}}
+{{- range $name, $cfg := .Values.consumers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chat-go.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" $name) | nindent 4 }}
+spec:
+  replicas: {{ $cfg.replicas }}
+  # Recreate, not RollingUpdate. During a rolling update the old and new pods
+  # both belong to the consumer group, which forces a rebalance, and the old
+  # pod may process a few more messages before it goes. Harmless given
+  # at-least-once delivery, but it means a deploy briefly doubles the
+  # in-flight work for no benefit — there is no availability to protect here,
+  # because a consumer being down costs lag, not errors.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" $name) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" $name) | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") $ | sha256sum }}
+    spec:
+      containers:
+        - name: {{ $name }}
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["/app/{{ $name }}"]
+          # Both sources wholesale, so every consumer sees the same settings
+          # the gateway does. The persister has no use for STUN_URL and the
+          # indexer none for BOT_QUEUE; config.Load simply ignores what it does
+          # not ask for. Curating four separate lists would buy tidiness and
+          # cost a component that quietly lost a variable it needed.
+          envFrom:
+            - configMapRef:
+                name: {{ include "chat-go.fullname" $ }}-config
+            - secretRef:
+                name: {{ include "chat-go.fullname" $ }}-secrets
+          resources:
+            {{- toYaml $cfg.resources | nindent 12 }}
+{{- end }}
