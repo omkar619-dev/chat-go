@@ -55,8 +55,20 @@ spec:
           env:
             - name: POSTGRES_USER
               value: {{ .Values.postgres.user | quote }}
+            # The password comes from the Secret, NOT from values — so it lives
+            # in exactly one place, and with secrets.create=false that place is
+            # a SealedSecret rather than a file in the repo.
+            #
+            # This has to be right the FIRST time. POSTGRES_PASSWORD is read
+            # only when initdb creates the cluster; on every later start the
+            # image ignores it entirely and the password already baked into the
+            # data directory wins. Changing it after the fact means an ALTER
+            # USER against the running database, or deleting the volume.
             - name: POSTGRES_PASSWORD
-              value: {{ .Values.postgres.password | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "chat-go.fullname" . }}-secrets
+                  key: POSTGRES_PASSWORD
             - name: POSTGRES_DB
               value: {{ .Values.postgres.database | quote }}
             # initdb refuses to initialise a directory that is not empty, and a

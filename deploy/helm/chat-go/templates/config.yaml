@@ -77,6 +77,11 @@ stringData:
   # so the template stays readable and there is no chance of committing a value
   # that is encoded just enough to look handled.
   DATABASE_URL: {{ include "chat-go.databaseURL" . | quote }}
+  # The same password twice, on purpose. Postgres reads POSTGRES_PASSWORD to
+  # initialise itself; everything else reads DATABASE_URL, which embeds it.
+  # They MUST agree — a mismatch produces a database that starts perfectly and
+  # rejects every client, which reads like an application bug.
+  POSTGRES_PASSWORD: {{ .Values.postgres.password | quote }}
   JWT_SECRET: {{ .Values.jwtSecret | quote }}
   TURN_SECRET: {{ .Values.turn.secret | quote }}
 {{- end }}
