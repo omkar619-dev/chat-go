@@ -1,0 +1,45 @@
+# Values for the homelab cluster — single-node k3s on the New PC.
+#
+#   helm upgrade chat-go deploy/helm/chat-go -f deploy/helm/chat-go/homelab.values.yaml
+#
+# Committed deliberately: nothing in here is secret. It describes WHERE this
+# deployment lives, not what it knows. The credentials arrive separately, from
+# deploy/sealed/homelab.yaml, which is the whole point of secrets.create=false.
+#
+# This file exists because the same three --set flags were being retyped on
+# every upgrade, and a flag you retype is a flag you eventually mistype.
+
+secrets:
+  # The Secret named <release>-secrets is NOT created by this chart. It is
+  # produced by the SealedSecret controller decrypting deploy/sealed/homelab.yaml,
+  # and it must exist BEFORE this chart is applied — Helm cannot express that
+  # dependency, because the thing depended on is no longer Helm's. See B5 in
+  # docs/HARDENING.md for how that went wrong the first time.
+  create: false
+
+ingress:
+  enabled: true
+
+  # The node's Tailscale MagicDNS name, not its LAN address.
+  #
+  # 192.168.29.51 is a DHCP lease. The Old PC's lease moved four times and took
+  # kubectl, Ollama and an ArgoCD application down with it each time. A tailnet
+  # name is assigned for the life of the node and never moves.
+  host: omkarhomelabnewpc.tail24646b.ts.net
+
+  # A genuine Let's Encrypt certificate, issued by Tailscale for the *.ts.net
+  # name — no domain purchase, no public exposure. Created out of band:
+  #
+  #   sudo tailscale cert omkarhomelabnewpc.tail24646b.ts.net
+  #   kubectl create secret tls chat-go-tls --cert=<...>.crt --key=<...>.key
+  #
+  # ⚠️ IT EXPIRES IN ABOUT 90 DAYS AND NOTHING RENEWS IT. Copying a certificate
+  # into a Secret takes a snapshot; re-run both commands before it lapses, or
+  # adopt the Tailscale Kubernetes operator, which owns the lifecycle properly.
+  tlsSecretName: chat-go-tls
+
+# Ollama runs on the Old PC, which is currently switched off awaiting repair.
+# Left pointing at it on purpose rather than blanked: the gateway degrades
+# around a missing Ollama by design — /search returns 503, the bot logs and
+# carries on, live chat is untouched — so this is a good standing test of that
+# claim rather than a configuration error to tidy away.

@@ -78,15 +78,43 @@ instance served `POST /login` and verified on whichever served `GET /ws`. That w
 while every instance holds the same key — the property a Kubernetes Secret must guarantee
 across replicas (see B5), and precisely the one the old default hid.
 
-### B4. No TLS
+### ~~B4. No TLS~~ — ✅ FIXED 2026-09-13 (deploy path)
 Everything is `http://` and `ws://`.
 
 **Why it's dangerous:** credentials, tokens and message bodies cross the network in
 plaintext. On any shared network this is a trivial capture.
 
-**Fix:** terminate TLS at the ingress (k3s + cert-manager, matching the existing homelab
-setup), serve `https://`, and have the client derive the socket scheme rather than
-hardcoding it: `location.protocol === 'https:' ? 'wss:' : 'ws:'`.
+**Fixed on the homelab.** Traefik terminates TLS at the Ingress, so the gateway keeps
+speaking plain HTTP inside the cluster and no Go code changed. The client already derives
+its socket scheme from `location.protocol`, so `wss://` followed automatically.
+
+**The certificate is real, and getting one without a domain is the interesting part.**
+Let's Encrypt needs a public domain pointing at a public IP; this box has neither. The way
+through is Tailscale, which issues genuine Let's Encrypt certificates for a node's
+`<host>.<tailnet>.ts.net` MagicDNS name — it owns that zone, so it can complete the DNS
+challenge itself. Enable HTTPS Certificates in the tailnet admin, then:
+
+```
+sudo tailscale cert omkarhomelabnewpc.tail24646b.ts.net
+kubectl create secret tls chat-go-tls --cert=<...>.crt --key=<...>.key
+```
+
+Verified by `curl` returning 200 **without** `-k`, which means the chain validated against
+the system trust store rather than being waved through.
+
+**A second thing this buys, beyond the blocker:** browsers refuse `getUserMedia` on a
+non-HTTPS origin that is not localhost, so every WebRTC test previously needed a throwaway
+`cloudflared` tunnel with a new URL each run. A stable HTTPS origin removes that entirely.
+
+**Two things still open:**
+
+1. **Nothing renews it.** `tailscale cert` issues ~90 days and copying it into a Secret
+   takes a point-in-time snapshot. Around day 80 it must be re-run and the Secret replaced.
+   The tidy fix is the Tailscale Kubernetes operator, which manages the lifecycle itself.
+2. **`sudo tailscale cert` writes the key as root, into the current directory** — which was
+   a git working tree. `.gitignore` covered `*.pem` and not `*.key`, so nothing would have
+   stopped it being committed. Moved out and ignored; worth remembering that the tool picks
+   the location, not you.
 
 ### ~~B5. Infrastructure credentials are hardcoded~~ — ✅ FIXED 2026-09-06 (deploy path)
 `docker-compose.yml` contains `chat:chat_dev` for Postgres; the connection string with

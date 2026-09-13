@@ -1,6 +1,11 @@
 # local env / secrets — never commit these
 .env
 *.pem
+# `sudo tailscale cert <host>` writes <host>.crt and <host>.key into whatever
+# directory you happen to be standing in — which was this one. *.pem did not
+# cover it. The tool picks the filename, so the ignore rule has to.
+*.key
+*.crt
 
 # Helm value overrides holding real secrets. The chart refuses to render
 # without a jwtSecret, so this file has to exist locally — which makes it
