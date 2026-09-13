@@ -1,0 +1,67 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+How traffic gets from a browser into the cluster.
+
+An Ingress is a ROUTING RULE, not a server. Something has to implement it — on
+k3s that is Traefik, which k3s installs and runs as a real Deployment in
+kube-system. The Ingress object just tells Traefik "requests for this Host and
+path go to that Service". Delete Traefik and this object still exists and does
+nothing at all.
+
+This replaces deploy/nginx.conf, and the comparison is the interesting part.
+That file needed three directives purely to keep WebSockets alive:
+
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+because Upgrade and Connection are HOP-BY-HOP headers, which a proxy is
+required by the HTTP spec to strip, and a WebSocket stops being HTTP the moment
+its 101 is sent. Traefik handles the upgrade natively and needs none of it.
+Worth knowing that this is a property of the proxy, not of Kubernetes: on an
+nginx ingress controller you are back to annotations doing the same job.
+
+One thing an Ingress does NOT fix: a rollout still drops every open WebSocket,
+because the pod behind it goes away. The browser does not reconnect — see the
+note in gateway.yaml. Nothing here changes that.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "chat-go.fullname" . }}
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "gateway") | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # ingressClassName, not the old kubernetes.io/ingress.class annotation. A
+  # cluster can run several controllers, and this is which one should claim
+  # this rule. Get it wrong and the object sits there ignored by everything,
+  # with no error to tell you.
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tlsSecretName }}
+  tls:
+    - hosts:
+        - {{ .Values.ingress.host | quote }}
+      # A Secret of type kubernetes.io/tls, holding tls.crt and tls.key.
+      # Traefik reads it and terminates TLS itself, so the gateway keeps
+      # speaking plain HTTP inside the cluster and needs no code change.
+      secretName: {{ .Values.ingress.tlsSecretName }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            # Prefix, so "/" matches everything — the UI, /login, /ws, /rooms.
+            # Exact would match ONLY "/" and every other path would 404, which
+            # is a confusing way to discover the difference.
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "chat-go.fullname" . }}-gateway
+                port:
+                  number: {{ .Values.gateway.port }}
+{{- end }}

@@ -43,6 +43,24 @@ secrets:
   # produces the Secret that would need it.
   create: true
 
+ingress:
+  # Off by default. On k3d there is no ingress controller and nothing to reach
+  # the cluster from; on the homelab, Traefik ships with k3s and this is how
+  # the gateway becomes reachable from a browser at all.
+  enabled: false
+  className: traefik
+  # The name the browser asks for. An Ingress routes on the Host header, so
+  # this has to be a name that actually resolves to the cluster — a tailnet
+  # MagicDNS name, or an /etc/hosts entry for a made-up one.
+  host: chat.local
+  annotations: {}
+  # Empty means plain HTTP. Set it to the name of a kubernetes.io/tls Secret to
+  # serve HTTPS — which is blocker B4, and which WebRTC requires: browsers
+  # refuse camera and microphone access on a non-HTTPS origin that is not
+  # localhost. Today that gap is papered over with a throwaway Cloudflare
+  # tunnel; a real certificate here removes the need for one.
+  tlsSecretName: ""
+
 gateway:
   # Two replicas, which is the arrangement phase 6.1 proved works: a JWT is
   # verified by recomputing its signature rather than looked up in a session
