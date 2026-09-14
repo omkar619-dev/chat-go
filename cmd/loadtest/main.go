@@ -71,21 +71,14 @@ func main() {
 	}
 	log.Printf("logged in as %q — opening %d connections to %s", *user, *conns, *base)
 
-	// http -> ws, https -> wss. Replacing only the FIRST occurrence leaves any
-	// "http" inside a path or query string alone.
-	wsURL := strings.Replace(*base, "http", "ws", 1) +
-		fmt.Sprintf("/ws?token=%s&room=%d", token, *room)
-
 	// A second identity for the stalled connections, so the watermark check is
 	// not confounded by the healthy connections sharing a user.
-	stallURL := wsURL
+	stallToken := token
 	if *stall > 0 {
-		stallToken, err := login(ctx, *base, *stallUser, *stallPass)
+		stallToken, err = login(ctx, *base, *stallUser, *stallPass)
 		if err != nil {
 			log.Fatalf("login %s: %v", *stallUser, err)
 		}
-		stallURL = strings.Replace(*base, "http", "ws", 1) +
-			fmt.Sprintf("/ws?token=%s&room=%d", stallToken, *room)
 		log.Printf("%d of %d connections will stall as %q", *stall, *conns, *stallUser)
 	}
 
@@ -115,9 +108,26 @@ func main() {
 			defer wg.Done()
 
 			// The first `stall` connections are the deliberately broken ones.
-			url, stalled := wsURL, id < *stall
+			connToken, stalled := token, id < *stall
 			if stalled {
-				url = stallURL
+				connToken = stallToken
+			}
+
+			// A ticket PER CONNECTION, because a ticket is single-use. The old
+			// code built one URL and dialled it N times; that would now give
+			// one success and N-1 rejections.
+			//
+			// This adds an HTTP round trip per connection that reusing one token
+			// did not, so "established per second" now includes minting. That is
+			// the real client path and the honest thing to measure — but it does
+			// mean ramp figures are not directly comparable with runs from
+			// before the ticket change.
+			url, err := socketURL(holdCtx, *base, connToken, *room)
+			if err != nil {
+				if n := failed.Add(1); n <= 5 {
+					log.Printf("conn %d: ticket failed: %v", id, err)
+				}
+				return
 			}
 
 			c, _, err := websocket.Dial(holdCtx, url, nil)
@@ -170,7 +180,7 @@ func main() {
 		// Only the READING connections count as subscribers for the expected-frame
 		// arithmetic — stalled ones are supposed to be evicted and receive nothing.
 		readers := int(int64(*conns)-failed.Load()) - *stall
-		publishPhase(holdCtx, wsURL, *redisAddr, *publish, *rate, *size, readers, &frames)
+		publishPhase(holdCtx, *base, token, *room, *redisAddr, *publish, *rate, *size, readers, &frames)
 		cancelHold()
 	}
 
@@ -200,7 +210,7 @@ func main() {
 // immune to how loaded the machine is — a contended CPU slows everything
 // uniformly, it does not turn 500 deliveries into 250 — which is what makes this
 // measurement trustworthy on a laptop that is also running the client.
-func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, size, subs int, frames *atomic.Int64) {
+func publishPhase(ctx context.Context, base, token string, room int64, redisAddr string, count, rate, size, subs int, frames *atomic.Int64) {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	defer rdb.Close()
 
@@ -216,7 +226,14 @@ func publishPhase(ctx context.Context, wsURL, redisAddr string, count, rate, siz
 	}
 	baseFrames := frames.Load()
 
-	pub, _, err := websocket.Dial(ctx, wsURL, nil)
+	// Its own ticket. The publisher is just another connection, and every
+	// already-open connection has spent the one it was given.
+	pubURL, err := socketURL(ctx, base, token, room)
+	if err != nil {
+		log.Printf("publisher ticket: %v", err)
+		return
+	}
+	pub, _, err := websocket.Dial(ctx, pubURL, nil)
 	if err != nil {
 		log.Printf("publisher dial: %v", err)
 		return
@@ -336,6 +353,56 @@ func progress(ctx context.Context, open, failed, frames *atomic.Int64) {
 			log.Printf("open=%d failed=%d frames=%d", open.Load(), failed.Load(), frames.Load())
 		}
 	}
+}
+
+// socketURL mints a fresh ticket and returns the WebSocket URL that spends it.
+//
+// One per connection, always. The token is still reused across connections —
+// logging in N times would measure bcrypt rather than the socket layer — but
+// the ticket cannot be, because redeeming it deletes it.
+//
+// http -> ws, https -> wss. Replacing only the FIRST occurrence leaves any
+// "http" inside a path or query string alone.
+func socketURL(ctx context.Context, base, token string, room int64) (string, error) {
+	ticket, err := mintTicket(ctx, base, token)
+	if err != nil {
+		return "", err
+	}
+	return strings.Replace(base, "http", "ws", 1) +
+		fmt.Sprintf("/ws?ticket=%s&room=%d", ticket, room), nil
+}
+
+// mintTicket exchanges a JWT for a single-use WebSocket ticket.
+//
+// The Authorization HEADER is the whole point — an ordinary HTTP request can
+// carry one, and a browser's WebSocket handshake cannot. That asymmetry is why
+// tickets exist; see internal/wsticket.
+func mintTicket(ctx context.Context, base, token string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/ws-ticket", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ws-ticket: %s", res.Status)
+	}
+	var body struct {
+		Ticket string `json:"ticket"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	if body.Ticket == "" {
+		return "", fmt.Errorf("no ticket in ws-ticket response")
+	}
+	return body.Ticket, nil
 }
 
 // login exchanges credentials for a JWT. POST /login returns {"token": "..."}.

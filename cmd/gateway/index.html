@@ -766,14 +766,45 @@
         headers: { 'Authorization': 'Bearer ' + tok },
       });
 
-      // Open the WebSocket — token + room ride in the query string.
+      // Trade the JWT for a single-use ticket BEFORE opening the socket.
+      //
+      // The token cannot ride in the socket URL. Query strings are written to
+      // every access log on the path, and a JWT is a working credential for 24
+      // hours — the gateway's own log used to contain complete, valid tokens.
+      //
+      // This request carries it in an Authorization header, like every other
+      // fetch on the page, and gets back something opaque that is worth nothing
+      // 30 seconds later and nothing at all once used. See internal/wsticket.
+      const ticketRes = await fetch('/ws-ticket', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + tok },
+      });
+      if (!ticketRes.ok) {
+        // 401 means the saved token has expired — bin it and show the login
+        // form, the same thing ws.onclose does for a rejected token. Anything
+        // else is Redis being unreachable, which is not the user's problem to
+        // solve and not a reason to make them log in again.
+        if (ticketRes.status === 401) {
+          localStorage.removeItem('chat_token');
+          document.getElementById('login').style.display = 'block';
+          document.getElementById('chat').style.display = 'none';
+          return;
+        }
+        showError('could not start a session — the server is having trouble, try again');
+        return;
+      }
+      const { ticket } = await ticketRes.json();
+
+      // Open the WebSocket — ticket + room ride in the query string.
       let opened = false;
       // Derive the socket scheme from the page's, never hardcode it. Over HTTPS a
       // browser BLOCKS a plain ws:// connection as mixed content — the page loads
       // fine and the socket silently never opens, which is a miserable thing to
       // debug. https -> wss, http -> ws.
       const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${wsScheme}//${location.host}/ws?token=${tok}&room=${room}`);
+      // The ticket needs no encoding: the server mints it with base64
+      // RawURLEncoding, whose alphabet is already query-string safe.
+      ws = new WebSocket(`${wsScheme}//${location.host}/ws?ticket=${ticket}&room=${room}`);
 
       ws.onopen = () => {
         opened = true;

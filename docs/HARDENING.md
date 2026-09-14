@@ -14,7 +14,7 @@ Status: **1 of 5 blockers closed** (B3, 2026-08-09). The rest run before Phase 8
 
 ## Blockers — must be fixed before any public exposure
 
-### B1. The JWT travels in the WebSocket URL query string
+### ~~B1. The JWT travels in the WebSocket URL query string~~ — ✅ FIXED 2026-09-15
 `cmd/gateway/index.html` connects with `ws://host/ws?token=<JWT>&room=1`, and
 `internal/httpapi/ws.go` reads it from `r.URL.Query()`.
 
@@ -29,13 +29,40 @@ Anyone with log access — or a log shipper, an APM vendor, a `Referer` header, 
 history — holds a working credential. This exists only because browsers cannot set custom
 headers on a WebSocket handshake, so the token was smuggled into the URL.
 
-**Fix:** short-lived single-use ticket.
-1. `POST /ws-ticket` authenticated normally (JWT in the `Authorization` header).
-2. Server generates a random opaque string, stores it in Redis with a ~30s TTL bound to the user id.
-3. Client connects with `?ticket=<random>`.
-4. Server redeems it: look up, **delete immediately** (single use), then authorize.
+**Fixed 2026-09-15** exactly as planned, in `internal/wsticket`:
 
-A leaked 30-second one-time ticket is worthless; a leaked 24-hour JWT is a skeleton key.
+1. `POST /ws-ticket` authenticated normally, JWT in the `Authorization` header.
+2. 32 bytes from `crypto/rand`, base64 `RawURLEncoding`, stored in Redis against the user
+   id and username with a 30s TTL.
+3. The client connects with `?ticket=<random>`.
+4. `Redeem` looks it up and deletes it **in one command**, then authorizes.
+
+**The ticket is still in the URL and still gets logged — that is not the point.** The fix is
+not hiding the credential better, it is sending one that is not worth stealing. By the time
+the value reaches a log file the legitimate client has already spent it, and it would have
+expired within 30 seconds regardless.
+
+**Three details that carry the security, and would be easy to undo by accident:**
+
+- **`GETDEL`, not `GET` then `DEL`.** With two commands, two handshakes arriving together
+  could both read the value before either deleted it, and a captured ticket would be
+  replayable for the width of that race. Redis executes commands one at a time, so `GETDEL`
+  cannot interleave. Splitting it "for readability" silently removes single-use.
+- **`crypto/rand`, not `math/rand`.** For its 30 seconds the ticket *is* a bearer
+  credential, and a predictable one lets an attacker guess a ticket that has been minted
+  but not yet spent.
+- **Redis unreachable means nobody can connect — deliberately.** Compare `cmd/bot`'s rate
+  limiter, which fails **open** on the same dependency. Both are right: the limiter guards
+  *cost*, so letting people through is generous; this guards *access*, so letting people
+  through is a hole. Same failure, opposite handling, for a reason worth being able to state.
+
+**Consequence for `cmd/loadtest`:** it now mints a ticket per connection, since one cannot
+be reused. The JWT is still fetched once — N logins would measure bcrypt rather than the
+socket layer — but establishment now includes an extra HTTP round trip, so ramp figures are
+**not comparable with runs from before this change**.
+
+Note this also makes I1 (token in `localStorage`) cheaper to fix later: the socket no longer
+needs the raw JWT at connect time, only something obtained with it.
 
 ### ~~B2. WebSocket origin verification is disabled~~ — ✅ FIXED 2026-09-14
 `internal/httpapi/ws.go` called `websocket.Accept` with `InsecureSkipVerify: true`.

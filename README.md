@@ -39,7 +39,50 @@ Backing services: **Postgres + pgvector**, **Redis** (pub/sub + presence), **Kaf
 8. **Deploy** on k3s (Helm) + tests + CI.  <- *you are here*
 
 Known gaps are tracked in [docs/HARDENING.md](docs/HARDENING.md) rather than left
-implied — four blockers remain open, and they gate public exposure, not the build.
+implied. **All four pre-exposure blockers are now closed** — TLS, secrets out of
+git, WebSocket origin verification, and no credential in a URL. What remains
+there is graded Important and Hygiene, and is written down rather than quietly
+carried.
+
+## Deployment
+
+It runs on a single-node **k3s** cluster on a machine in my flat, reachable over
+Tailscale at a stable HTTPS address. One command brings the whole thing up on an
+empty cluster — seven components, its own schema, and credentials it reads but
+this repository does not contain.
+
+```bash
+helm upgrade --install chat-go deploy/helm/chat-go -f deploy/helm/chat-go/homelab.values.yaml
+```
+
+**Images come from CI.** `.github/workflows/ci.yml` builds and pushes to
+`ghcr.io/omkar619-dev/chat-go` on every push to `main`, tagged `sha-<commit>`.
+The deployed tag is pinned in `homelab.values.yaml`, so what is running is
+recorded in git and a rollback is a revert. The mutable `main` tag is published
+too, and deliberately not used for deployment — two nodes pulling it an hour
+apart can run different code while reporting the same version.
+
+**Credentials never enter the repository.** The chart is installed with
+`secrets.create=false`, so it consumes a Secret it does not create. That Secret
+is produced by a **SealedSecret** (`deploy/sealed/homelab.yaml`) — encrypted with
+the target cluster's public key, which makes the ciphertext safe to commit and
+readable by exactly one cluster. Postgres takes its password from the same
+Secret, so there is one copy rather than two that can disagree.
+
+**TLS is a real certificate, without owning a domain.** Traefik terminates it at
+the Ingress; the certificate is issued by Tailscale for the node's `*.ts.net`
+name, which works because Tailscale controls that DNS zone and can answer the
+challenge itself. `curl` validates it against the system trust store with no
+`-k`. That also removes a recurring nuisance: browsers refuse camera access on a
+non-HTTPS origin, so WebRTC testing previously needed a throwaway tunnel with a
+new URL every session.
+
+**What deploying found.** The chart was correct on a local k3d cluster and still
+shipped a bug that made a fresh install unusable: the front end hardcoded a join
+to room 1, and a new database has no rooms at all. It had worked on every
+database it had ever run against, because room 1 had existed since phase 1 — so
+that path had never executed. Running it somewhere genuinely new is the only
+thing that finds those.
 
 ## Measured, not assumed
 

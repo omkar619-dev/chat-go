@@ -12,11 +12,11 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/omkar619-dev/chat-go/internal/auth"
 	"github.com/omkar619-dev/chat-go/internal/broker"
 	"github.com/omkar619-dev/chat-go/internal/hub"
 	"github.com/omkar619-dev/chat-go/internal/presence"
 	"github.com/omkar619-dev/chat-go/internal/repository/postgres/sqlc"
+	"github.com/omkar619-dev/chat-go/internal/wsticket"
 )
 
 // The wire format of a chat message lives in the broker package as
@@ -26,10 +26,20 @@ import (
 // pub/sub channel: messages typed here are PUBLISHED; messages on the channel
 // are pushed down this socket.
 func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
-	// 1. Authenticate from the query string (browsers can't set WS headers).
-	claims, err := auth.VerifyToken(r.URL.Query().Get("token"), h.JWTSecret)
+	// 1. Redeem a single-use ticket.
+	//
+	// This used to read a JWT straight out of the query string, because a
+	// browser cannot set headers on a WebSocket handshake. It worked, and it
+	// wrote a complete 24-hour credential into every access log on the path —
+	// chi's, Traefik's, and anything shipping them onward.
+	//
+	// The ticket is still in the URL, and still gets logged. The difference is
+	// that it is worth nothing by then: Redeem deletes it atomically, so the
+	// value in the log has already been spent by the client that used it, and
+	// it would have expired within 30 seconds regardless. See internal/wsticket.
+	holder, err := wsticket.Redeem(r.Context(), h.Redis, r.URL.Query().Get("ticket"))
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid or missing token")
+		writeError(w, http.StatusUnauthorized, "invalid or missing ticket")
 		return
 	}
 
@@ -41,7 +51,7 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	}
 	member, err := h.Queries.IsRoomMember(r.Context(), sqlc.IsRoomMemberParams{
 		RoomID: roomID,
-		UserID: claims.UserID,
+		UserID: holder.UserID,
 	})
 	if err != nil || !member {
 		writeError(w, http.StatusForbidden, "not a member of this room")
@@ -90,7 +100,7 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	//    Registered BEFORE the watermark defer so the defer can close over `sub`
 	//    and ask whether we were evicted. Defers run last-in-first-out, so the
 	//    watermark still runs before Close.
-	sub := h.Hub.Join(roomID, claims.UserID)
+	sub := h.Hub.Join(roomID, holder.UserID)
 
 	// Presence teardown. Registered FIRST so it runs LAST — after sub.Close()
 	// below has removed this socket from the hub. Without that ordering, HasUser
@@ -102,9 +112,9 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 
 		// Only mark them gone if this was their LAST socket on this gateway —
 		// closing one tab must not sign you out of the other.
-		if !h.Hub.HasUser(roomID, claims.UserID) {
-			if err := presence.MarkOffline(leaveCtx, h.Redis, roomID, claims.UserID); err != nil {
-				log.Printf("presence offline (room %d, user %d): %v", roomID, claims.UserID, err)
+		if !h.Hub.HasUser(roomID, holder.UserID) {
+			if err := presence.MarkOffline(leaveCtx, h.Redis, roomID, holder.UserID); err != nil {
+				log.Printf("presence offline (room %d, user %d): %v", roomID, holder.UserID, err)
 			}
 		}
 		h.announcePresence(leaveCtx, roomID)
@@ -118,8 +128,8 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	// every 15 seconds, so without this the nudge would arrive ahead of the data
 	// it is telling clients to go and fetch — and they would read a list that
 	// still doesn't contain the person who just arrived.
-	if err := presence.MarkOnline(ctx, h.Redis, roomID, claims.UserID); err != nil {
-		log.Printf("presence online (room %d, user %d): %v", roomID, claims.UserID, err)
+	if err := presence.MarkOnline(ctx, h.Redis, roomID, holder.UserID); err != nil {
+		log.Printf("presence online (room %d, user %d): %v", roomID, holder.UserID, err)
 	}
 	h.announcePresence(ctx, roomID)
 
@@ -142,17 +152,17 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if sub.Slow() {
 			log.Printf("evicted slow reader (room %d, user %d) — watermark left unchanged",
-				roomID, claims.UserID)
+				roomID, holder.UserID)
 			return
 		}
 		saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := h.Queries.UpsertRoomRead(saveCtx, sqlc.UpsertRoomReadParams{
 			RoomID:     roomID,
-			UserID:     claims.UserID,
+			UserID:     holder.UserID,
 			LastReadAt: pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
 		}); err != nil {
-			log.Printf("read watermark (room %d, user %d): %v", roomID, claims.UserID, err)
+			log.Printf("read watermark (room %d, user %d): %v", roomID, holder.UserID, err)
 		}
 	}()
 
@@ -210,7 +220,7 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 				if err := json.Unmarshal(ev.Payload, &sig); err != nil {
 					continue
 				}
-				if sig.To != claims.UserID {
+				if sig.To != holder.UserID {
 					continue // not for us
 				}
 				f = frame{Type: frameSignal, From: sig.From, Kind: sig.Kind, Signal: sig.Data}
@@ -264,7 +274,7 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		// is to make the whole inbound direction typed, which is a protocol change
 		// worth making once rather than twice.
 		if strings.HasPrefix(trimmed, "{") {
-			h.handleClientFrame(ctx, conn, roomID, claims.UserID, []byte(trimmed))
+			h.handleClientFrame(ctx, conn, roomID, holder.UserID, []byte(trimmed))
 			continue
 		}
 
@@ -272,14 +282,14 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		// the gateway, not a message to the room. Note this runs in a goroutine so
 		// the user can keep chatting while a summary streams.
 		if strings.EqualFold(trimmed, catchupCommand) {
-			go h.streamCatchup(ctx, conn, roomID, claims.UserID)
+			go h.streamCatchup(ctx, conn, roomID, holder.UserID)
 			continue
 		}
 
 		payload, err := json.Marshal(broker.ChatMessage{
 			RoomID:   roomID,
-			UserID:   claims.UserID,
-			Username: claims.Username,
+			UserID:   holder.UserID,
+			Username: holder.Username,
 			Body:     string(data),
 			SentAt:   time.Now().UTC(), // stamped HERE — the true send time
 		})
@@ -302,14 +312,14 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 		// failure must cost latency, not data.
 		redisErr := h.Redis.Publish(ctx, channel, payload).Err()
 		if redisErr != nil {
-			log.Printf("redis publish (room %d, user %d): %v", roomID, claims.UserID, redisErr)
+			log.Printf("redis publish (room %d, user %d): %v", roomID, holder.UserID, redisErr)
 		}
 
 		// Keyed by room_id (Hash balancer) so one room's messages land in one
 		// partition and stay ordered for the persister.
 		kafkaErr := h.Producer.Publish(ctx, strconv.FormatInt(roomID, 10), payload)
 		if kafkaErr != nil {
-			log.Printf("kafka publish (room %d, user %d): %v", roomID, claims.UserID, kafkaErr)
+			log.Printf("kafka publish (room %d, user %d): %v", roomID, holder.UserID, kafkaErr)
 		}
 
 		// Silence is only correct when both planes worked.

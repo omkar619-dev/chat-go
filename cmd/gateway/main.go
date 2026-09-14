@@ -140,6 +140,10 @@ func main() {
 	r.Post("/login", h.Login)
 	r.With(h.RequireAuth).Get("/me", h.Me)               // protected: needs a valid Bearer token
 	r.With(h.RequireAuth).Get("/ice-config", h.ICEConfig) // where to find STUN/TURN
+	// Authenticated with a Bearer HEADER, which is the entire point: it converts
+	// a credential an ordinary request can carry into one a WebSocket URL can,
+	// without the JWT itself ever reaching a log. See internal/wsticket.
+	r.With(h.RequireAuth).Post("/ws-ticket", h.WSTicket)
 	r.Route("/rooms", func(pr chi.Router) {
 		pr.Use(h.RequireAuth) // every /rooms route requires a valid token
 		pr.Post("/", h.CreateRoom)
