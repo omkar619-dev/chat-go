@@ -49,7 +49,31 @@ func (h *Handlers) WS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Upgrade to a WebSocket.
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	//
+	// InsecureSkipVerify is GONE. With it set, the library skipped the origin
+	// check entirely — and that is Cross-Site WebSocket Hijacking: any page on
+	// any domain could open a socket to this gateway while the victim was
+	// logged in here.
+	//
+	// The reason this needs saying out loud is that the same-origin policy which
+	// stops an ordinary fetch() reading another site's response DOES NOT APPLY
+	// to WebSockets. There is no preflight and no CORS on a socket handshake.
+	// Checking Origin is the server's job, and switching it off removed the only
+	// thing doing it.
+	//
+	// With OriginPatterns empty, coder/websocket requires the browser's Origin
+	// host to equal the request's Host. That is exactly right here — this
+	// gateway serves the page itself, so they always match, and both nginx and
+	// Traefik forward the original Host. AllowedOrigins exists for tunnels,
+	// which do not; see the note on that field in internal/config.
+	//
+	// A non-browser client sends no Origin at all and is let through, which
+	// cmd/loadtest depends on. That is not a hole: Origin is a browser-enforced
+	// statement about which page opened the connection, not an authentication
+	// mechanism. The real gate is the JWT above and the IsRoomMember check.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: h.AllowedOrigins,
+	})
 	if err != nil {
 		return
 	}

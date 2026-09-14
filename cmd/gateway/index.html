@@ -584,6 +584,27 @@
       await switchRoom(created.id);
     }
 
+    // showRoomless drops into the chat view with NO room open.
+    //
+    // A fresh install has no rooms, so there is nothing to join. Leaving the
+    // login form up would blame the wrong thing — the account is fine; what's
+    // missing is a room, and the box for creating one lives inside the chat
+    // view. So show the view, open no socket, and say what to do next.
+    //
+    // `room = 0` is load-bearing, not tidiness. switchRoom() opens with
+    // `if (id === room) return;` to avoid churning the socket needlessly, and
+    // the first room ever created gets id 1 — which is exactly the value `room`
+    // would still be holding. Parking it on an id no room can have is what
+    // makes the next createRoom() actually connect instead of silently
+    // returning and leaving the page looking broken.
+    function showRoomless() {
+      room = 0;
+      document.getElementById('login').style.display = 'none';
+      document.getElementById('chat').style.display = 'block';
+      refreshRooms();
+      showError('no rooms yet — type a name above and press Create to start one');
+    }
+
     // ── Sign out ─────────────────────────────────────────────────────────────
     // Forgets the token here and closes the socket. It does NOT revoke anything:
     // the token stays valid on the server until it expires, so a copy of it would
@@ -712,6 +733,30 @@
       // Without this, switching rooms briefly shows the old room's members as if
       // they were in the new one.
       document.getElementById('onlinenames').textContent = '—';
+
+      // Work out which room to open BEFORE trying to join one.
+      //
+      // `room` comes from localStorage and falls back to 1 — and 1 is a GUESS.
+      // It happened to hold on every database this had ever run against, because
+      // room 1 has existed since phase 1, so this path never executed. On a
+      // genuinely fresh install there are no rooms at all: the join below 404s,
+      // the socket never opens, and the page sits on the login form with no way
+      // forward except curl. Deploying to an empty cluster is what finally ran it.
+      const roomsRes = await fetch('/rooms', { headers: { 'Authorization': 'Bearer ' + tok } });
+      if (roomsRes.ok) {
+        const rooms = await roomsRes.json();
+        if (rooms.length === 0) {
+          showRoomless();
+          return;
+        }
+        // A remembered room can also be gone, or belong to a different
+        // deployment's database — this browser's localStorage survives across
+        // both. Falling back to the first room beats failing, and beats asking.
+        if (!rooms.some(r => r.id === room)) {
+          room = rooms[0].id;
+          localStorage.setItem('chat_room', String(room));
+        }
+      }
 
       // Make sure we're a member of the room (idempotent — safe to repeat). This
       // is also what makes clicking an unjoined room work: the click switches to

@@ -30,6 +30,11 @@ type Handlers struct {
 	Embedder  *embed.Client // embeds search queries; only /search needs it
 	Generator *llm.Client   // streams "catch me up" summaries down the WebSocket
 
+	// Extra origins permitted to open a WebSocket. Empty means same-origin only,
+	// which is correct everywhere except behind a tunnel that rewrites the Host
+	// header. See internal/config and the long note in ws.go.
+	AllowedOrigins []string
+
 	// WebRTC ICE, served to the browser by /ice-config. TurnSecret never leaves
 	// this process — only the short-lived credentials derived from it do.
 	StunURL    string

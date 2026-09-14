@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,21 @@ type Config struct {
 	BotQueue      int           // questions that may wait before new ones are shed
 	BotMaxAge     time.Duration // a question older than this when picked up is binned
 	BotRatePerMin int           // per-user mention budget
+
+	// Extra origins allowed to open a WebSocket, beyond the same-origin default.
+	//
+	// Empty is the safe and normal setting: the socket library then requires the
+	// browser's Origin host to equal the request's Host, and since this gateway
+	// serves the page itself, those always match. nginx and Traefik both forward
+	// the original Host, so an ordinary proxy does not break it.
+	//
+	// A TUNNEL does. `cloudflared tunnel --url http://localhost:8090` serves the
+	// page at a trycloudflare.com address but forwards to the origin with
+	// Host: localhost:8090 — so Origin and Host disagree and every socket is
+	// refused. That is the case this setting exists for, which is why it names
+	// permitted hosts instead of offering an "off" switch: the off switch is
+	// what B2 was.
+	AllowedOrigins []string
 
 	// WebRTC ICE. Served to the browser at /ice-config rather than baked into
 	// the page, because the TURN server runs ON DEMAND on a cheap cloud instance
@@ -94,6 +110,9 @@ func Load() Config {
 		BotMaxAge:     getenvDuration("BOT_MAX_AGE", 90*time.Second),
 		BotRatePerMin: getenvInt("BOT_RATE_PER_MIN", 3),
 
+		// Comma-separated, e.g. "*.trycloudflare.com,chat.example.org".
+		AllowedOrigins: getenvList("ALLOWED_ORIGINS"),
+
 		// Google's public STUN. Safe to use free because STUN relays nothing — it
 		// only tells a browser what its own address looks like from outside.
 		StunURL:    getenv("STUN_URL", "stun:stun.l.google.com:19302"),
@@ -110,6 +129,21 @@ func getenvDuration(key string, fallback time.Duration) time.Duration {
 		return d
 	}
 	return fallback
+}
+
+// getenvList splits a comma-separated variable, trimming blanks. An unset or
+// empty variable yields nil rather than a one-element slice containing "" —
+// which matters here, because nil means "same-origin only" while a slice
+// holding an empty string would be a pattern that matches nothing and would
+// look identical in a config dump.
+func getenvList(key string) []string {
+	var out []string
+	for _, part := range strings.Split(os.Getenv(key), ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // getenvInt is getenv for integers, falling back on anything unparseable rather

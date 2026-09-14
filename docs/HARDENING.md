@@ -37,18 +37,37 @@ headers on a WebSocket handshake, so the token was smuggled into the URL.
 
 A leaked 30-second one-time ticket is worthless; a leaked 24-hour JWT is a skeleton key.
 
-### B2. WebSocket origin verification is disabled
-`internal/httpapi/ws.go` calls `websocket.Accept` with `InsecureSkipVerify: true`.
+### ~~B2. WebSocket origin verification is disabled~~ — ✅ FIXED 2026-09-14
+`internal/httpapi/ws.go` called `websocket.Accept` with `InsecureSkipVerify: true`.
 
-**Why it's dangerous:** this permits **Cross-Site WebSocket Hijacking**. Any website the
-user visits can open a socket to our gateway. Today the blast radius is limited because the
-attacker also needs the token, but the moment auth moves to anything the browser attaches
-automatically (a cookie), this becomes a full account takeover.
+**Why it was dangerous:** it permitted **Cross-Site WebSocket Hijacking**. Any website the
+user visited could open a socket to the gateway. The blast radius was limited only because
+the attacker also needed the token; the moment auth moves to something a browser attaches
+automatically — a cookie, which is where B1 and I1 are heading — it becomes account takeover.
 
-**Fix:** delete the option. `coder/websocket` defaults to requiring the `Origin` host to
-match the `Host` header, which is exactly right for a same-origin deployment. If the front
-end is ever served from a different host, use `OriginPatterns` with an explicit allowlist —
-never a wildcard.
+**The part worth remembering:** the same-origin policy that stops an ordinary `fetch()`
+reading another site's response **does not apply to WebSockets**. There is no preflight and
+no CORS on a socket handshake. Checking `Origin` is the server's job, and that option was
+the only thing doing it.
+
+**Fixed** by deleting the option. With `OriginPatterns` empty, `coder/websocket` requires
+the browser's `Origin` host to equal the request's `Host` — correct here, because the
+gateway serves the page itself, and both nginx (`proxy_set_header Host $host`) and Traefik
+forward the original Host.
+
+**Why an allowlist exists rather than just a deletion.** A *tunnel* breaks the match:
+`cloudflared tunnel --url http://localhost:8090` serves the page at a `trycloudflare.com`
+address but forwards to the origin with `Host: localhost:8090`, so `Origin` and `Host`
+disagree and every socket is refused. `ALLOWED_ORIGINS` (comma-separated, supports `*`
+wildcards) names extra hosts for exactly that case. It deliberately takes host patterns and
+offers no "off" switch — an off switch is what this blocker was.
+
+The gateway logs which mode it is in at startup, because "the socket won't connect" and
+"this origin isn't on the list" are indistinguishable from a browser.
+
+**Non-browser clients send no `Origin` at all and are allowed through**, which `cmd/loadtest`
+relies on. Not a hole: `Origin` is a browser-enforced statement about which page opened the
+connection, not authentication. The real gate is the JWT and the `IsRoomMember` check.
 
 ### ~~B3. The JWT signing secret has a working default~~ — ✅ FIXED 2026-08-09
 `internal/config/config.go` fell back to `JWTSecret: "dev-change-me"`.

@@ -99,10 +99,21 @@ func main() {
 		Embedder:  embedder,
 		Generator: generator,
 
+		AllowedOrigins: cfg.AllowedOrigins,
+
 		StunURL:    cfg.StunURL,
 		TurnURL:    cfg.TurnURL,
 		TurnSecret: cfg.TurnSecret,
 		TurnTTL:    cfg.TurnTTL,
+	}
+
+	// Say which origins may open a socket, for the same reason the TURN line
+	// below exists: "the socket won't connect" and "this origin isn't on the
+	// list" look identical from a browser, and only one of them is a config fix.
+	if len(cfg.AllowedOrigins) == 0 {
+		log.Println("ws: same-origin only (set ALLOWED_ORIGINS for tunnels that rewrite Host)")
+	} else {
+		log.Printf("ws: same-origin plus %v", cfg.AllowedOrigins)
 	}
 
 	// Say out loud whether a relay is configured. Without this, "calls fail on
