@@ -9,6 +9,33 @@
 # This file exists because the same three --set flags were being retyped on
 # every upgrade, and a flag you retype is a flag you eventually mistype.
 
+image:
+  # Pulled from the registry CI publishes to, instead of being built by hand on
+  # the node and side-loaded with `docker save | k3s ctr images import`. That
+  # worked, but it meant the running code existed only on that one machine and
+  # nothing recorded which commit produced it.
+  repository: ghcr.io/omkar619-dev/chat-go
+
+  # An IMMUTABLE tag, deliberately — not `main`.
+  #
+  # `main` moves with every push, so two nodes pulling it an hour apart can run
+  # different code while both reporting the same tag, and a rollback means
+  # rebuilding rather than re-pointing. A sha tag names exactly one build
+  # forever, which means this line answers "what is deployed" with something you
+  # can `git checkout`.
+  #
+  # Updating it is a COMMIT, and that is the feature: the repository becomes the
+  # record of what is running, with history and a rollback that is just a revert.
+  # Automating the bump is what ArgoCD Image Updater does; doing it by hand a few
+  # times first is how you find out what it is automating.
+  tag: sha-ef5b0e3
+
+  # IfNotPresent is CORRECT here precisely because the tag is immutable: the same
+  # tag can never mean different bytes, so a cached copy is never stale. With a
+  # mutable tag like `main` this setting would be a bug — nodes would keep
+  # serving whatever they happened to pull first.
+  pullPolicy: IfNotPresent
+
 secrets:
   # The Secret named <release>-secrets is NOT created by this chart. It is
   # produced by the SealedSecret controller decrypting deploy/sealed/homelab.yaml,
