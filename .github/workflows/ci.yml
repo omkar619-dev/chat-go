@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The default GITHUB_TOKEN can read the repo but NOT write packages. Granting
+# the two scopes needed here, explicitly, is better than a personal access
+# token: this one is minted per run, expires when the run ends, and cannot be
+# copied out and reused.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # "omkar619-dev/chat-go" — already lowercase, which matters because ghcr
+  # rejects capitals in a repository name and the error says "invalid
+  # reference format" rather than anything about case.
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  # Everything that can fail fast, before spending minutes on a container build.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it here, so the
+          # toolchain cannot drift from what the code declares.
+          go-version-file: go.mod
+          cache: true
+
+      - run: go build ./...
+      - run: go vet ./...
+
+      # There are no tests yet — H1 in docs/HARDENING.md. This passes trivially
+      # today and is here so that adding the first test needs no CI change, and
+      # so nobody can add one that fails without noticing.
+      - run: go test ./...
+
+      - uses: azure/setup-helm@v4
+
+      # Linted TWICE, because the chart has two genuinely different shapes and
+      # only one of them is what the homelab runs.
+      #
+      # First with secrets.create defaulting to true, which requires jwtSecret —
+      # this also proves the chart's `fail` still fires, since omitting the value
+      # here would break the build.
+      - run: helm lint deploy/helm/chat-go --set jwtSecret=ci-lint-only-not-a-real-key
+
+      # Then with the real homelab values: secrets.create=false, ingress on,
+      # TLS on. That is the configuration that actually ships, so it is the one
+      # a typo would otherwise reach production through.
+      - run: helm lint deploy/helm/chat-go -f deploy/helm/chat-go/homelab.values.yaml
+
+  image:
+    needs: check          # a broken build must never publish an image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # Two tags, and they are not interchangeable.
+          #
+          # sha-<short> is IMMUTABLE — it names exactly one build forever, so
+          # "what is running in the cluster" has an answer you can check out.
+          # This is the one deployments should use.
+          #
+          # "main" is MUTABLE and moves with every push. Convenient for a quick
+          # pull, and a trap for deployment: two nodes pulling `main` an hour
+          # apart can run different code while reporting the same tag, and
+          # rolling back means rebuilding rather than re-pointing.
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=main,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Build on a pull request to prove the Dockerfile still works, but do
+          # not publish — a PR from a fork would otherwise push an image from
+          # unreviewed code under the repository's own name.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Provenance attestations turn the push into a multi-manifest index.
+          # Harmless on modern containerd, and one more thing that can go wrong
+          # between here and a k3s node for no benefit we are using.
+          provenance: false
+          # Layer cache in GitHub's own storage. Without it every run re-downloads
+          # every Go module; with it, an unchanged go.sum restores in seconds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
