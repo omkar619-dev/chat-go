@@ -69,6 +69,26 @@ The gateway logs which mode it is in at startup, because "the socket won't conne
 relies on. Not a hole: `Origin` is a browser-enforced statement about which page opened the
 connection, not authentication. The real gate is the JWT and the `IsRoomMember` check.
 
+**Verified, with the same handshake twice and one header changed:**
+
+```
+curl --http1.1 -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+     -H "Origin: https://<the gateway's own host>"  ...  ->  101
+     -H "Origin: https://evil.example.com"          ...  ->  403
+```
+
+**Three earlier attempts at this test all failed for the wrong reason**, and the pattern is
+worth keeping. A browser `WebSocket()` from a hostile page closes with code `1006` — but so
+does an invalid token, a mangled paste, and a URL that never reached the server. Everything
+upstream of the check rejects too, and from outside every rejection looks identical.
+
+`101` on the control is what makes the `403` mean something: it proves the token, the room
+and the membership were all fine, so only the origin can account for the difference. Getting
+there needed the server's own status codes (`401` = token, `403` = origin) rather than the
+browser's verdict, and curl rather than a console, because a console keeps running in
+whichever tab you last used.
+
 ### ~~B3. The JWT signing secret has a working default~~ — ✅ FIXED 2026-08-09
 `internal/config/config.go` fell back to `JWTSecret: "dev-change-me"`.
 
