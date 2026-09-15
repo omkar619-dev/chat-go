@@ -343,7 +343,7 @@ grounding answers in its own output), but the `/search` API does **not** filter 
 That may well be correct — a user might want to find something the bot said — but it
 should be a deliberate decision, not an accident of where the filter happens to live.
 
-### H5. Nothing notices when a consumer stops
+### ~~H5. Nothing notices when a consumer stops~~ — ✅ FIXED 2026-09-15
 Found the hard way on 2026-08-10. The persister was not running for several hours. Nothing
 reported it — not the gateway, not the browser, no error frame anywhere.
 
@@ -359,11 +359,43 @@ persister, so an idle persister looks exactly like lost messages from the UI. Th
 never lost; it was still sitting in Kafka and drained the moment the persister restarted,
 which is the at-least-once design working as intended.
 
-**Fix:** export **consumer lag** — the gap between the newest offset in a partition and the
-last offset a group has committed — for all three groups (`persister`, `indexer`, `bot`), and
-alert on it growing. Lag is the right signal precisely because it catches *both* failure
-modes with one number: a consumer that has died, and one that is merely too slow. Natural
-fit alongside Phase 8, since the homelab already runs Prometheus.
+**FIXED 2026-09-15.** `cmd/lagexporter` publishes `chat_go_consumer_lag{group=...}` for all
+three groups; a `ServiceMonitor` and `PrometheusRule` ship with the chart.
+
+**It is a separate process, and that is the design, not packaging.** The first attempt had
+each consumer report its own lag, and kafka-go refused outright — `ReadLag` is "unavailable
+when GroupID is set". That looked like a library limitation and is the correct answer to the
+wrong question: **a consumer that has died cannot report its own lag.** Every number
+available in-process — `Reader.Lag()`, or the high water mark on the last fetched message —
+stops updating at exactly the moment the failure occurs, and a frozen zero is
+indistinguishable from keeping up. So the exporter reads Kafka's own bookkeeping instead:
+newest offset per partition, committed offset per group. Neither needs the consumer alive.
+
+A group that has **never committed** is measured from the log's first offset, not treated as
+zero — otherwise a consumer that never started at all would report perfect health.
+
+**The alert expression is the part that needed thinking about.** The obvious rule is "lag is
+growing" (`delta(...) > 0`) and it would have missed the real instance found on the day this
+shipped: the indexer was stuck at exactly 10 because Ollama was unreachable, the room was
+quiet, and the lag was therefore completely flat. Nothing new arriving means nothing to grow.
+
+What distinguishes *stuck* from *busy* is **time spent behind** — a working consumer returns
+to zero within seconds, a stopped one never does. Hence `chat_go_consumer_lag > 0` held
+`for: 15m`, plus a separate high-threshold rule for a consumer that is alive and losing
+ground. Two different problems, two different fixes.
+
+**Proven by the bug it found.** On first deployment the alert went PENDING for
+`group="indexer"`, value 10 — a pod that was `1/1 Running`, zero restarts, doing exactly what
+it was told to do, and making no progress because a dependency on another machine was
+switched off. Any liveness probe would have called it healthy. That is the whole point of
+the metric, demonstrated without having to stage it.
+
+`ChatGoLagUnknown` fires when the exporter cannot reach Kafka, because a stale gauge renders
+as a flat line at zero and reads as perfect health — the same invisible failure one level up.
+
+Still true, and still the reason this matters: the persister retries in place and never
+advances past a failed message, so a poison message stops that partition rather than skipping
+it. Stuck and dead look identical from outside; lag is what tells them apart.
 
 Related: the persister deliberately retries in place and never advances past a failed message
 (see the offset-commit note in the Phase 2 history), which means a poison message stops that
