@@ -302,10 +302,32 @@ disable auto-creation.
 
 ## Hygiene — before calling it finished
 
-### H1. No tests
-No unit or integration tests exist. The highest-value targets, in order: the `auth` package
-(token generation/verification, including the algorithm-confusion guard), the persister's
-at-least-once commit ordering, and an end-to-end WebSocket round trip.
+### H1. No tests — ◑ PARTIAL, security surface covered 2026-09-15
+Started at the security-critical surface rather than at coverage. CI runs `go test -race ./...`.
+
+**`internal/auth`** — round trip, wrong secret, tampered payload, expiry, and
+`TestVerifyTokenRejectsAlgNone`, which forges a token declaring `alg: none` and requires it
+to be refused. That one exists because a JWT names its own algorithm, so a verifier that
+trusts the header accepts anything an attacker writes. If the `*jwt.SigningMethodHMAC`
+assertion is ever "simplified" away, every other test still passes and only that one fails.
+Plus `TestPasswordHashesAreSalted`, which pins a property everyone assumes and nobody checks.
+
+**`internal/wsticket`** — single-use, expiry, uniqueness, and
+`TestConcurrentRedeemYieldsExactlyOneWinner`: eight goroutines released at one ticket,
+exactly one may win. The sequential single-use test is **not** sufficient, and that is the
+point of having both — splitting `GETDEL` into a `GET` then a `DEL` still passes
+sequentially, because the ticket does get deleted, just not atomically. Only the concurrent
+test notices. Uses `miniredis` rather than a mock: a mock would assert that we *called*
+`GETDEL`, and the property under test is what `GETDEL` *does*.
+
+**`internal/config`** — `RequireJWTSecret` rejects unset and the placeholder (B3), and
+`getenvList` returns nil rather than a one-element empty slice, which is the difference
+between "same-origin only" and a pattern that matches nothing.
+
+**Still open**, in order of value: the persister's at-least-once commit ordering — the
+offset-commit bug from Phase 2 is the single most expensive mistake in this repo's history
+and nothing would catch its return — then the hub's slow-reader eviction, then an
+end-to-end WebSocket round trip.
 
 ### H2. Access logs record full URLs
 `middleware.Logger` logs the complete request URI, which is how B1's tokens ended up in the

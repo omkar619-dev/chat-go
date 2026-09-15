@@ -3,6 +3,7 @@ module github.com/omkar619-dev/chat-go
 go 1.25.5
 
 require (
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/coder/websocket v1.8.15
 	github.com/go-chi/chi/v5 v5.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -20,6 +21,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.15.9 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.40.0 // indirect

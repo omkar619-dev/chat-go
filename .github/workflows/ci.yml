@@ -37,10 +37,13 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
 
-      # There are no tests yet — H1 in docs/HARDENING.md. This passes trivially
-      # today and is here so that adding the first test needs no CI change, and
-      # so nobody can add one that fails without noticing.
-      - run: go test ./...
+      # -race, which is not run locally because it needs a C toolchain and the
+      # dev machine is Windows. It earns its place here:
+      # TestConcurrentRedeemYieldsExactlyOneWinner releases eight goroutines at
+      # one ticket, and the detector sees unsynchronised access that a passing
+      # assertion would not. A concurrency test without -race checks the outcome
+      # but not the mechanism.
+      - run: go test -race ./...
 
       - uses: azure/setup-helm@v4
 
