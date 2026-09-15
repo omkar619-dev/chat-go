@@ -102,6 +102,23 @@ consumers:
       requests: {cpu: 50m, memory: 32Mi}
       limits: {memory: 128Mi}
 
+# Publishes how far each consumer group is behind, on /metrics.
+#
+# A SEPARATE process, and that is the design rather than a packaging accident: a
+# consumer that has died cannot report its own lag. Anything measured inside a
+# consumer freezes at a healthy-looking value exactly when it stops — which is
+# what made the H5 outage invisible for hours. See cmd/lagexporter.
+lagExporter:
+  enabled: true
+  port: 9100
+  # How often it asks Kafka. Matches a typical scrape interval: faster costs a
+  # round trip per group for resolution nobody reads, much slower and repeated
+  # scrapes return the same stale number, turning a rising line into a staircase.
+  pollInterval: 15s
+  resources:
+    requests: {cpu: 50m, memory: 32Mi}
+    limits: {memory: 128Mi}
+
 # Bot load shedding. Env-tunable rather than baked in precisely because these
 # paths only run under pressure — proving they work means making the limits
 # absurd on purpose, and editing constants to do that is how a test value ends

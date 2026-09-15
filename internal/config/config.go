@@ -35,6 +35,16 @@ type Config struct {
 	BotMaxAge     time.Duration // a question older than this when picked up is binned
 	BotRatePerMin int           // per-user mention budget
 
+	// Where each Kafka consumer serves /metrics, and how often it asks the
+	// broker for its lag.
+	//
+	// Same port on all three consumers: in Kubernetes every pod has its own IP,
+	// so there is no collision. Running them side by side on ONE machine —
+	// which is exactly what local development does — they would fight over it,
+	// hence the env var.
+	MetricsAddr    string
+	LagPollInterval time.Duration
+
 	// Extra origins allowed to open a WebSocket, beyond the same-origin default.
 	//
 	// Empty is the safe and normal setting: the socket library then requires the
@@ -109,6 +119,13 @@ func Load() Config {
 		BotQueue:      getenvInt("BOT_QUEUE", 8),
 		BotMaxAge:     getenvDuration("BOT_MAX_AGE", 90*time.Second),
 		BotRatePerMin: getenvInt("BOT_RATE_PER_MIN", 3),
+
+		MetricsAddr: getenv("METRICS_ADDR", ":9100"),
+		// 15s matches a typical Prometheus scrape interval. Faster would cost a
+		// Kafka round trip per consumer for resolution nobody reads; much slower
+		// and a scrape would repeatedly return the same stale number, which
+		// makes a rising lag look like a staircase rather than a slope.
+		LagPollInterval: getenvDuration("LAG_POLL_INTERVAL", 15*time.Second),
 
 		// Comma-separated, e.g. "*.trycloudflare.com,chat.example.org".
 		AllowedOrigins: getenvList("ALLOWED_ORIGINS"),

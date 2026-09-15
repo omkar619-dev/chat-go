@@ -41,6 +41,9 @@ data:
 
   HUB_BUFFER: {{ .Values.hubBuffer | quote }}
 
+  METRICS_ADDR: ":{{ .Values.lagExporter.port }}"
+  LAG_POLL_INTERVAL: {{ .Values.lagExporter.pollInterval | quote }}
+
   BOT_WORKERS: {{ .Values.bot.workers | quote }}
   BOT_QUEUE: {{ .Values.bot.queue | quote }}
   BOT_MAX_AGE: {{ .Values.bot.maxAge | quote }}

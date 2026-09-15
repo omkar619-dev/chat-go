@@ -1,0 +1,90 @@
+{{- if .Values.lagExporter.enabled }}
+{{/*
+Publishes consumer lag for every group, from outside every consumer.
+
+The separation is the whole design. A consumer that has died cannot report its
+own lag — kafka-go says so plainly, refusing ReadLag when a GroupID is set —
+because any number computed in-process stops updating at exactly the moment the
+failure occurs, and a frozen zero is indistinguishable from keeping up. That is
+what made the H5 outage invisible: the persister was down for hours, and every
+signal that existed came from the parts still working.
+
+So it reads Kafka's own bookkeeping instead: the newest offset per partition,
+and the offset each group has committed. Both live on the broker, and neither
+needs the consumer to be alive to answer.
+
+ONE replica, and it must stay one. Two would publish the same series twice with
+different pod labels, and any alert doing `max()` or `sum()` over them would be
+wrong in a different way for each. This is a measurement, not a workload —
+there is nothing to scale.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "chat-go.fullname" . }}-lagexporter
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "lagexporter") | nindent 4 }}
+  annotations:
+    # The convention a plain Prometheus reads via kubernetes_sd_configs. Kept
+    # even though a ServiceMonitor would also work, because it costs nothing and
+    # means the exporter is scrapeable by whichever Prometheus turns up.
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.lagExporter.port | quote }}
+    prometheus.io/path: /metrics
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics       # named, because a ServiceMonitor selects ports by name
+      port: {{ .Values.lagExporter.port }}
+      targetPort: metrics
+  selector:
+    {{- include "chat-go.selectorLabels" (dict "root" $ "component" "lagexporter") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "chat-go.fullname" . }}-lagexporter
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "lagexporter") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "lagexporter") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "chat-go.labels" (dict "root" $ "component" "lagexporter") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/config.yaml") $ | sha256sum }}
+    spec:
+      containers:
+        - name: lagexporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/lagexporter"]
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.lagExporter.port }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "chat-go.fullname" . }}-config
+            - secretRef:
+                name: {{ include "chat-go.fullname" . }}-secrets
+          # This one CAN be probed usefully, unlike the consumers — it serves a
+          # port, and an exporter that has stopped serving is the monitoring
+          # going blind. Which is worth catching, because the failure mode of a
+          # dead monitor is a dashboard full of reassuring flat lines.
+          readinessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /metrics, port: metrics}
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.lagExporter.resources | nindent 12 }}
+{{- end }}

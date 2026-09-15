@@ -25,7 +25,7 @@ ENV CGO_ENABLED=0 GOOS=linux
 # nothing useful (line numbers survive) but a debugger cannot attach.
 RUN mkdir -p /out && \
     go build -ldflags="-s -w" -o /out/ \
-      ./cmd/gateway ./cmd/persister ./cmd/indexer ./cmd/bot ./cmd/migrate
+      ./cmd/gateway ./cmd/persister ./cmd/indexer ./cmd/bot ./cmd/migrate ./cmd/lagexporter
 
 # ---------- runtime ----------
 FROM alpine:3.20
