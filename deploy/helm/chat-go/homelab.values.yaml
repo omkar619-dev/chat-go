@@ -28,7 +28,7 @@ image:
   # record of what is running, with history and a rollback that is just a revert.
   # Automating the bump is what ArgoCD Image Updater does; doing it by hand a few
   # times first is how you find out what it is automating.
-  tag: sha-c55fdcc
+  tag: sha-fc89654
 
   # IfNotPresent is CORRECT here precisely because the tag is immutable: the same
   # tag can never mean different bytes, so a cached copy is never stale. With a
