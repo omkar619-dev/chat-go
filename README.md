@@ -36,7 +36,7 @@ Backing services: **Postgres + pgvector**, **Redis** (pub/sub + presence), **Kaf
 5. ✅ **"Catch me up"** summarization.
 6. ✅ **Presence + multi-gateway scaling** — Redis heartbeats, two gateways behind nginx, load shedding.
 7. ✅ **WebRTC** voice/video — signalling over the existing socket, STUN + coturn TURN.
-8. **Deploy** on k3s (Helm) + tests + CI.  <- *you are here*
+8. ✅ **Deploy** on k3s — Helm chart, sealed secrets, CI to ghcr, TLS, consumer-lag alerting.
 
 Known gaps are tracked in [docs/HARDENING.md](docs/HARDENING.md) rather than left
 implied. **All four pre-exposure blockers are now closed** — TLS, secrets out of
@@ -96,6 +96,27 @@ process, fanned out in memory. Measured with `PUBSUB NUMSUB` and
 **Slow readers.** A socket that stops reading gets a bounded queue, then a
 disconnect — not an unbounded buffer. Verified by stalling one client
 deliberately and watching it get evicted while the others kept up.
+
+**Consumer lag**, which caught a real failure on the day it shipped. A separate
+process (`cmd/lagexporter`) publishes how far each consumer group is behind, and
+Prometheus alerts when a group stays behind. Two things about it are less obvious
+than they look:
+
+*It cannot live inside the consumers.* The first attempt had each one report its
+own lag, and `kafka-go` refuses — `ReadLag` is "unavailable when GroupID is set".
+That is the right answer to the wrong question: **a consumer that has died cannot
+report its own lag.** Anything measured in-process freezes at a healthy-looking
+value at exactly the moment the failure happens. So the exporter reads Kafka's own
+bookkeeping instead — newest offset per partition, committed offset per group —
+neither of which needs the consumer alive.
+
+*The obvious alert would have missed the real bug.* "Lag is growing" is what you
+reach for first. The failure it found was the indexer stuck at exactly 10, because
+Ollama was unreachable and the room was quiet — so the lag was perfectly flat and
+a growth-based rule would have said nothing. What separates *stuck* from *busy* is
+**time spent behind**: a working consumer returns to zero in seconds, a stopped one
+never does. The pod was `1/1 Running` with zero restarts the whole time, which is
+precisely why a liveness probe was never going to catch it.
 
 **WebRTC paths**, from `RTCPeerConnection.getStats()`:
 
