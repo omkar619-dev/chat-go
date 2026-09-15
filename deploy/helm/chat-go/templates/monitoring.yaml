@@ -1,0 +1,100 @@
+{{- if .Values.monitoring.enabled }}
+{{/*
+Tells Prometheus to scrape the lag exporter, and what to shout about.
+
+Both objects are Prometheus Operator CRDs, which is why the whole file is
+optional: on a cluster without the operator these kinds do not exist and the
+release would fail to install. Monitoring should not be able to break the thing
+it monitors.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "chat-go.fullname" . }}-lagexporter
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "lagexporter") | nindent 4 }}
+    {{- with .Values.monitoring.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "chat-go.selectorLabels" (dict "root" $ "component" "lagexporter") | nindent 6 }}
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  endpoints:
+    - port: metrics          # the NAME from the Service, not a number
+      path: /metrics
+      interval: {{ .Values.monitoring.scrapeInterval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "chat-go.fullname" . }}-lag
+  labels:
+    {{- include "chat-go.labels" (dict "root" $ "component" "lagexporter") | nindent 4 }}
+    {{- with .Values.monitoring.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: chat-go.consumer-lag
+      rules:
+        # A consumer that has STOPPED.
+        #
+        # The obvious expression — lag is growing — is wrong here, and getting
+        # that wrong would have missed the real instance found on the day this
+        # was written. The indexer was stuck at exactly 10 because Ollama was
+        # unreachable, and the room was quiet, so nothing new arrived and the
+        # lag did not grow at all. `delta() > 0` would have stayed silent while
+        # a consumer made zero progress for hours.
+        #
+        # What actually distinguishes stuck from busy is TIME SPENT BEHIND. A
+        # working consumer returns to zero within seconds; one that has stopped
+        # never does. Hence `> 0` held for fifteen minutes.
+        - alert: ChatGoConsumerStuck
+          expr: chat_go_consumer_lag > 0
+          for: {{ .Values.monitoring.stuckFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "chat-go consumer group {{`{{ $labels.group }}`}} has made no progress"
+            description: >-
+              {{`{{ $labels.group }}`}} has been {{`{{ $value }}`}} messages behind for
+              {{ .Values.monitoring.stuckFor }}. The process is probably running and
+              healthy — that is the point of this alert. Check whether a dependency it
+              needs is reachable: the indexer and bot both call Ollama, the persister
+              needs Postgres.
+
+        # A consumer that is ALIVE and losing ground. Different problem,
+        # different fix — this one is about capacity, not a dead dependency.
+        - alert: ChatGoConsumerBacklog
+          expr: chat_go_consumer_lag > {{ .Values.monitoring.backlogThreshold }}
+          for: {{ .Values.monitoring.backlogFor }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "chat-go consumer group {{`{{ $labels.group }}`}} is falling behind"
+            description: >-
+              {{`{{ $labels.group }}`}} is {{`{{ $value }}`}} messages behind and not
+              catching up. Messages are durable in Kafka, so nothing is lost — but
+              history, search and the bot are all serving stale data until it drains.
+
+        # And the one that watches the watcher.
+        #
+        # If the exporter cannot reach Kafka, every gauge holds its last value —
+        # which renders as a flat line at zero and reads as perfect health. That
+        # is the same invisible-failure shape as H5 itself, one level up, so it
+        # gets an alert rather than only a log line.
+        - alert: ChatGoLagUnknown
+          expr: increase(chat_go_consumer_lag_read_errors_total[10m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "chat-go lag exporter cannot read from Kafka"
+            description: >-
+              The lag figures are stale and must not be trusted. A stale gauge looks
+              exactly like a healthy one, so treat consumer lag as UNKNOWN until this
+              clears — not as zero.
+{{- end }}

@@ -36,6 +36,18 @@ image:
   # serving whatever they happened to pull first.
   pullPolicy: IfNotPresent
 
+monitoring:
+  # The Prometheus Operator CRDs exist on this cluster (kube-prometheus-stack,
+  # release "kps" in the monitoring namespace), so the ServiceMonitor and
+  # PrometheusRule can be rendered here. They stay off on k3d, where there is no
+  # operator and the kinds do not exist.
+  enabled: true
+  # kube-prometheus-stack adopts only PrometheusRules carrying its own release
+  # label. Naming it here beats disabling the selector cluster-wide, which would
+  # make Prometheus adopt every rule anyone ever applied.
+  extraLabels:
+    release: kps
+
 secrets:
   # The Secret named <release>-secrets is NOT created by this chart. It is
   # produced by the SealedSecret controller decrypting deploy/sealed/homelab.yaml,

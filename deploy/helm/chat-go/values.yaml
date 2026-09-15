@@ -119,6 +119,30 @@ lagExporter:
     requests: {cpu: 50m, memory: 32Mi}
     limits: {memory: 128Mi}
 
+# ServiceMonitor + PrometheusRule for the exporter above.
+#
+# OFF by default, because both are Prometheus Operator CRDs. On a cluster
+# without the operator installed, rendering them fails the whole release — and a
+# chart that refuses to install because of an optional monitoring extra is a bad
+# trade. On by default would also be a lie on the k3d dev cluster.
+monitoring:
+  enabled: false
+  scrapeInterval: 30s
+
+  # kube-prometheus-stack only adopts rules carrying its own release label,
+  # unless you disable that selector. Naming it here is more portable than
+  # turning the selector off cluster-wide.
+  extraLabels: {}
+
+  # A group has been behind AT ALL for this long. Deliberately zero rather than
+  # a big number: in a chat this quiet, anything uncommitted for a quarter of an
+  # hour means a consumer has stopped, not that it is busy.
+  stuckFor: 15m
+
+  # A real backlog — the consumer is alive and losing ground.
+  backlogThreshold: 500
+  backlogFor: 5m
+
 # Bot load shedding. Env-tunable rather than baked in precisely because these
 # paths only run under pressure — proving they work means making the limits
 # absurd on purpose, and editing constants to do that is how a test value ends
