@@ -77,8 +77,25 @@ ingress:
   # adopt the Tailscale Kubernetes operator, which owns the lifecycle properly.
   tlsSecretName: chat-go-tls
 
-# Ollama runs on the Old PC, which is currently switched off awaiting repair.
-# Left pointing at it on purpose rather than blanked: the gateway degrades
-# around a missing Ollama by design — /search returns 503, the bot logs and
-# carries on, live chat is untouched — so this is a good standing test of that
-# claim rather than a configuration error to tidy away.
+ollama:
+  # Ollama now runs on THIS node, not the Old PC. It moved because the Old PC is
+  # awaiting repair, and it stays because a Ryzen 3100 beats a Core 2 Duo even
+  # without GPU offload, and all-minilm is 23M parameters — trivial on CPU.
+  #
+  # The node's own LAN address: pods route to their node directly, and Ollama is
+  # bound to 0.0.0.0 by a systemd drop-in at
+  # /etc/systemd/system/ollama.service.d/override.conf (a drop-in, not
+  # `systemctl set-environment`, so it survives package upgrades and reboots).
+  #
+  # ⚠️ This is a DHCP lease. The Old PC's moved four times and broke kubectl,
+  # Ollama and an ArgoCD app on each occasion — put a reservation on this MAC.
+  # The tailnet address would be stable, but pod-to-tailnet routing is one more
+  # thing to be wrong, and this one is verified working from inside a pod.
+  url: http://192.168.29.51:11434
+
+# The period with Ollama unreachable was not wasted: it is what the consumer-lag
+# alert caught on its first day, with the indexer stuck at exactly 10 messages
+# while its pod reported 1/1 Running and zero restarts. Worth remembering that
+# the system degraded correctly throughout — /search returned "the embedding
+# service is down", live chat was untouched — and that degrading correctly is
+# exactly what made the failure invisible until something measured it.
