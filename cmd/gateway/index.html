@@ -5,135 +5,452 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>chat-go</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 620px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { margin-bottom: 1rem; }
-    #messages { border: 1px solid #ccc; border-radius: 6px; height: 320px; overflow-y: auto;
-                padding: 0.5rem 0.75rem; margin: 1rem 0; background: #fafafa; }
-    .msg { margin: 0.3rem 0; line-height: 1.4; }
-    .msg b { color: #2563eb; }
-    .msg .time { color: #9ca3af; font-size: 0.8em; font-variant-numeric: tabular-nums; }
-    input { padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; font: inherit; }
-    button { padding: 0.5rem 0.9rem; border: 0; border-radius: 6px; background: #2563eb;
-             color: #fff; cursor: pointer; font: inherit; }
-    #chat { display: none; }
-    .row { display: flex; gap: 0.5rem; }
-    #input, #q { flex: 1; }
-    #searchbox { margin-top: 1.5rem; border-top: 1px solid #e5e7eb; padding-top: 1rem; }
-    #results { margin-top: 0.75rem; }
-    .hit { padding: 0.4rem 0.6rem; margin: 0.3rem 0; background: #f3f4f6;
-           border-left: 3px solid #2563eb; border-radius: 4px; line-height: 1.4; }
-    .hit .score { color: #6b7280; font-size: 0.8em; float: right; }
-    .hit b { color: #2563eb; }
-    .empty { color: #6b7280; font-size: 0.9em; }
-    #summary { display: none; margin-top: 1rem; padding: 0.6rem 0.8rem; line-height: 1.5;
-               background: #eff6ff; border-left: 3px solid #2563eb; border-radius: 4px;
-               white-space: pre-wrap; }
-    #summary.waiting { color: #6b7280; font-style: italic; }
-    /* Room switcher */
-    #topbar { align-items: center; justify-content: space-between; margin-bottom: 0.7rem; }
-    #rooms { display: flex; gap: 0.35rem; flex-wrap: wrap; }
-    #rooms button { background: #e5e7eb; color: #374151; padding: 0.35rem 0.7rem;
-                    font-size: 0.9em; }
-    #rooms button.current { background: #2563eb; color: #fff; }
-    /* A room you haven't joined looks different, because clicking it JOINS you. */
-    #rooms button.guest { border: 1px dashed #9ca3af; background: #fff; color: #6b7280; }
-    #signout { background: #6b7280; padding: 0.35rem 0.7rem; font-size: 0.9em; }
-    #newroom { margin-bottom: 0.7rem; }
-    #newroom input { flex: 1; font-size: 0.9em; padding: 0.35rem 0.5rem; }
-    #newroom button { background: #16a34a; padding: 0.35rem 0.7rem; font-size: 0.9em; }
-    #online { margin-bottom: 0.6rem; font-size: 0.9em; }
-    #online .label { color: #6b7280; text-transform: uppercase; font-size: 0.78em;
-                     letter-spacing: 0.06em; }
-    #onlinenames { color: #16a34a; font-weight: 600; }   /* green, like every other "online" dot */
-    #onlinenames .person { margin-right: 0.6rem; white-space: nowrap; }
-    .callbtn { background: #16a34a; padding: 0.1rem 0.4rem; font-size: 0.75em;
-               margin-left: 0.25rem; vertical-align: middle; }
+    /* ──────────────────────────────────────────────────────────────────────
+       Everything is in this file, on purpose. No CDN for a CSS framework and
+       no build step: this app is served over a tailnet, and a stylesheet
+       fetched from the public internet would mean it renders wrong on exactly
+       the private network it is meant for. //go:embed puts the whole page in
+       the binary, and that should stay true of how it looks.
+       ────────────────────────────────────────────────────────────────────── */
 
-    #relaytoggle { display: block; margin-bottom: 0.6rem; font-size: 0.82em; color: #6b7280; }
-    /* Calling */
-    #ringing { margin: 0.6rem 0; padding: 0.6rem 0.8rem; background: #fffbeb;
-               border-left: 3px solid #f59e0b; border-radius: 4px; }
-    #ringing button { padding: 0.25rem 0.6rem; font-size: 0.85em; margin-left: 0.4rem; }
-    #ringing .accept { background: #16a34a; }
-    #ringing .reject { background: #dc2626; }
-    #callarea { margin: 0.6rem 0; padding: 0.6rem; background: #f3f4f6; border-radius: 6px; }
-    #callarea video { width: 48%; background: #000; border-radius: 4px; }
-    /* muted on the local video is not cosmetic — without it you hear yourself
-       through your own speakers and the mic picks it up again. */
-    #callinfo { font-size: 0.85em; color: #374151; margin: 0.4rem 0; font-family: ui-monospace, monospace; }
-    #callarea .hangup { background: #dc2626; padding: 0.3rem 0.7rem; font-size: 0.85em; }
-    /* An error must not look like a summary. Same panel, unmistakably different. */
-    #summary.error { background: #fef2f2; border-left-color: #dc2626; color: #991b1b;
-                     font-weight: 500; }
+    :root {
+      --bg:        #f6f7f9;
+      --surface:   #ffffff;
+      --surface-2: #f1f3f5;
+      --border:    #e3e6ea;
+      --text:      #16181d;
+      --text-dim:  #6b7280;
+      --text-faint:#9aa1ab;
+      --accent:    #4f46e5;
+      --accent-2:  #6366f1;
+      --accent-bg: #eef2ff;
+      --green:     #15a34a;
+      --amber:     #d97706;
+      --amber-bg:  #fffbeb;
+      --red:       #dc2626;
+      --red-bg:    #fef2f2;
+      --radius:    10px;
+      --shadow:    0 1px 2px rgb(16 24 40 / 6%), 0 1px 3px rgb(16 24 40 / 4%);
+    }
+
+    /* Follows the operating system. No toggle, because a toggle is a setting to
+       store, sync and get wrong, and the OS already knows the answer. */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:        #0f1115;
+        --surface:   #171a21;
+        --surface-2: #1e222b;
+        --border:    #2a2f3a;
+        --text:      #e7e9ee;
+        --text-dim:  #9aa1ab;
+        --text-faint:#6b7280;
+        --accent:    #6366f1;
+        --accent-2:  #818cf8;
+        --accent-bg: #1e1b3a;
+        --green:     #22c55e;
+        --amber:     #f59e0b;
+        --amber-bg:  #2a2010;
+        --red:       #f87171;
+        --red-bg:    #2a1516;
+        --shadow:    0 1px 2px rgb(0 0 0 / 40%);
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    /* `hidden` is ONLY a rule in the browser's default stylesheet —
+       `[hidden] { display: none }` — so any author rule that sets display outranks
+       it. `#ringing { display: flex }` below did exactly that, and the result was an
+       Accept/Reject bar permanently on screen with no call in progress, while the
+       script was setting .hidden correctly the whole time. The attribute was right;
+       it just had no authority. This gives it some.
+
+       NOTE THE CONSEQUENCE: !important also beats an inline style, so an element
+       revealed with `el.style.display = ...` must NEVER carry the hidden attribute —
+       it could not be un-hidden. The split in this file is deliberate:
+         .hidden        → #ringing, #callarea
+         style.display  → #chat, #login, #summary
+       Pick one per element. Mixing them is how this bug happens in reverse. */
+    [hidden] { display: none !important; }
+
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      /* dvh, not vh: on mobile the address bar changes the viewport height, and
+         vh would leave the composer hidden behind it. */
+      min-height: 100dvh;
+    }
+
+    input, textarea, select {
+      padding: 0.6rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color .12s, box-shadow .12s;
+    }
+    input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+    input::placeholder { color: var(--text-faint); }
+
+    button {
+      padding: 0.6rem 0.95rem;
+      border: 0;
+      border-radius: var(--radius);
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 500;
+      transition: filter .12s, transform .04s;
+    }
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: translateY(1px); }
+
+    .row { display: flex; gap: 0.5rem; }
+
+    /* ── Login ─────────────────────────────────────────────────────────────── */
+    #login {
+      max-width: 340px;
+      margin: 14vh auto;
+      padding: 1.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+    }
+    #login .brand { font-size: 1.4rem; font-weight: 650; letter-spacing: -0.02em; margin-bottom: 0.25rem; }
+    #login .tagline { color: var(--text-dim); font-size: 0.88rem; margin-bottom: 1.25rem; }
+    #login input { width: 100%; margin-bottom: 0.6rem; }
+    #login button { width: 100%; margin-top: 0.3rem; }
+    #error { color: var(--red); font-size: 0.88rem; margin: 0.75rem 0 0; min-height: 1.2em; }
+
+    /* ── App shell ─────────────────────────────────────────────────────────── */
+    /* The grid lives on #shell, NOT on #chat. The script toggles #chat with an
+       inline style.display, and an inline style would override a grid declared
+       here — so the container that is toggled and the container that lays out
+       are deliberately two different elements. */
+    #shell {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      height: 100dvh;
+    }
+
+    #sidebar {
+      display: flex;
+      flex-direction: column;
+      gap: 1.1rem;
+      padding: 1rem;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+    }
+    #sidebar .brand { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.02em; }
+    .side-label {
+      color: var(--text-faint);
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      letter-spacing: 0.08em;
+      font-weight: 600;
+      margin-bottom: 0.45rem;
+    }
+
+    /* Rooms are a vertical list now, not a row of pills — a sidebar scales to
+       twenty rooms, a horizontal strip does not. */
+    #rooms { display: flex; flex-direction: column; gap: 0.15rem; }
+    #rooms button {
+      background: transparent;
+      color: var(--text-dim);
+      text-align: left;
+      padding: 0.45rem 0.6rem;
+      font-weight: 500;
+      border-radius: 8px;
+    }
+    #rooms button::before { content: "# "; color: var(--text-faint); }
+    #rooms button:hover { background: var(--surface-2); color: var(--text); filter: none; }
+    #rooms button.current { background: var(--accent); color: #fff; }
+    #rooms button.current::before { color: rgb(255 255 255 / 60%); }
+    /* A room you have NOT joined looks different, because clicking it joins you.
+       Dashed, so the difference survives being colour-blind. */
+    #rooms button.guest { border: 1px dashed var(--border); color: var(--text-faint); }
+
+    #newroom input { flex: 1; min-width: 0; font-size: 0.85rem; padding: 0.4rem 0.55rem; }
+    #newroom button { background: var(--green); padding: 0.4rem 0.7rem; font-size: 0.85rem; }
+
+    #onlinenames { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.9rem; }
+    #onlinenames .person { display: flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+    /* The green dot is the status; the name is just a name. Putting the state in
+       a separate element means a name can never be mistaken for a state. */
+    #onlinenames .person::before {
+      content: ""; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green); flex: none;
+    }
+    #onlinenames .empty { color: var(--text-faint); font-size: 0.85rem; }
+    .callbtn {
+      background: var(--green); padding: 0.1rem 0.45rem;
+      font-size: 0.7rem; border-radius: 6px;
+    }
+
+    #sidebar .spacer { flex: 1; }
+    #relaytoggle {
+      display: flex; align-items: center; gap: 0.4rem;
+      font-size: 0.78rem; color: var(--text-dim);
+    }
+    #signout { background: var(--surface-2); color: var(--text-dim); font-size: 0.85rem; }
+
+    /* ── Main column ───────────────────────────────────────────────────────── */
+    #main {
+      display: grid;
+      /* header / scrolling middle / composer. `1fr` on the middle row plus
+         min-height:0 is what lets it scroll instead of pushing the composer off
+         the bottom of the screen — a grid item's default min-height is auto,
+         which means "as tall as my content". */
+      grid-template-rows: auto 1fr auto;
+      min-height: 0;
+    }
+    #topbar {
+      display: flex; align-items: center; gap: 0.75rem;
+      padding: 0.85rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    #roomtitle { font-weight: 600; font-size: 1rem; }
+    #roomtitle::before { content: "# "; color: var(--text-faint); }
+    #topbar .grow { flex: 1; }
+    #topbar input { font-size: 0.85rem; padding: 0.4rem 0.6rem; width: 230px; }
+    #topbar button { font-size: 0.85rem; padding: 0.4rem 0.7rem; }
+
+    #scroll { overflow-y: auto; min-height: 0; padding: 1.1rem 1.25rem; }
+
+    /* ── Messages ──────────────────────────────────────────────────────────── */
+    #messages { display: flex; flex-direction: column; gap: 0.5rem; }
+    .msg {
+      max-width: min(70%, 560px);
+      padding: 0.5rem 0.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px 12px 12px 4px;
+      box-shadow: var(--shadow);
+      line-height: 1.45;
+      overflow-wrap: anywhere;   /* a 400-character word must not widen the page */
+    }
+    /* Your own messages sit on the right and carry the accent. This is the one
+       piece of chrome that makes a transcript readable at a glance — without it
+       you read every line to work out who said it. */
+    .msg.own {
+      margin-left: auto;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      border-radius: 12px 12px 4px 12px;
+    }
+    .msg .meta {
+      display: flex; align-items: baseline; gap: 0.5rem;
+      margin-bottom: 0.15rem;
+    }
+    .msg b { color: var(--accent-2); font-size: 0.82rem; font-weight: 600; }
+    .msg.own b { color: rgb(255 255 255 / 85%); }
+    .msg .time {
+      color: var(--text-faint); font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .msg.own .time { color: rgb(255 255 255 / 60%); }
+
+    /* ── Composer ──────────────────────────────────────────────────────────── */
+    #composer {
+      display: flex; gap: 0.5rem;
+      padding: 0.85rem 1.25rem;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+    }
+    #input { flex: 1; }
+    #catchup { background: var(--surface-2); color: var(--text-dim); }
+
+    /* ── Panels: summary, errors, search results ───────────────────────────── */
+    #summary {
+      display: none; margin-bottom: 0.9rem;
+      padding: 0.7rem 0.9rem; line-height: 1.55;
+      background: var(--accent-bg); border-left: 3px solid var(--accent);
+      border-radius: 8px; white-space: pre-wrap;
+    }
+    #summary.waiting { color: var(--text-dim); font-style: italic; }
+    /* An error must not look like a summary. Same panel, unmistakably different —
+       colour AND weight, so it still reads as wrong in greyscale. */
+    #summary.error {
+      background: var(--red-bg); border-left-color: var(--red);
+      color: var(--red); font-weight: 500;
+    }
+
+    #results { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.9rem; }
+    .hit {
+      display: flex; align-items: baseline; gap: 0.6rem;
+      padding: 0.5rem 0.7rem;
+      background: var(--surface-2); border-left: 3px solid var(--accent);
+      border-radius: 8px; line-height: 1.45;
+    }
+    .hit b { color: var(--accent-2); }
+    .hit .score {
+      margin-left: auto; flex: none;
+      color: var(--text-faint); font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .empty { color: var(--text-dim); font-size: 0.9rem; }
+
+    /* ── Calling ───────────────────────────────────────────────────────────── */
+    #ringing {
+      display: flex; align-items: center; gap: 0.6rem;
+      margin-bottom: 0.9rem; padding: 0.7rem 0.9rem;
+      background: var(--amber-bg); border-left: 3px solid var(--amber);
+      border-radius: 8px;
+    }
+    #ringingwho { flex: 1; font-weight: 500; }
+    #ringing button { padding: 0.35rem 0.75rem; font-size: 0.85rem; }
+    #ringing .accept { background: var(--green); }
+    #ringing .reject { background: var(--red); }
+
+    #callarea {
+      margin-bottom: 0.9rem; padding: 0.75rem;
+      background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    #videos { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+    #callarea video {
+      width: 100%; aspect-ratio: 4 / 3; object-fit: cover;
+      background: #000; border-radius: 8px;
+    }
+    #callinfo {
+      font-size: 0.8rem; color: var(--text-dim); margin: 0.55rem 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    #callarea .hangup { background: var(--red); padding: 0.35rem 0.8rem; font-size: 0.85rem; }
+
+    /* ── Narrow screens ────────────────────────────────────────────────────── */
+    /* The sidebar becomes a strip above the conversation rather than disappearing
+       behind a hamburger: room switching and the online list are the two things
+       you actually need on a phone, and a menu you have to open hides both. */
+    @media (max-width: 760px) {
+      #shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
+      #sidebar {
+        flex-direction: row; flex-wrap: wrap; align-items: center;
+        gap: 0.6rem; border-right: 0; border-bottom: 1px solid var(--border);
+      }
+      #sidebar .side-label, #sidebar .spacer, #newroom { display: none; }
+      #rooms { flex-direction: row; flex-wrap: wrap; }
+      #onlinenames { flex-direction: row; flex-wrap: wrap; gap: 0.6rem; }
+      #topbar input { width: 100%; }
+      .msg { max-width: 88%; }
+      #videos { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>chat-go</h1>
-
   <!-- Login view -->
   <div id="login">
-    <input id="username" placeholder="username" autocomplete="off">
-    <input id="password" type="password" placeholder="password">
-    <button onclick="login()">Login</button>
-    <p id="error" style="color:#dc2626"></p>
+    <div class="brand">chat-go</div>
+    <div class="tagline">Real-time chat, semantic search and calling.</div>
+    <input id="username" placeholder="username" autocomplete="username">
+    <input id="password" type="password" placeholder="password" autocomplete="current-password">
+    <button onclick="login()">Sign in</button>
+    <p id="error"></p>
   </div>
 
-  <!-- Chat view (hidden until logged in) -->
-  <div id="chat">
-    <!-- One button per room. Filled from GET /rooms, which also tells us which
-         ones we're already a member of. -->
-    <div class="row" id="topbar">
-      <div id="rooms"></div>
-      <button id="signout" onclick="signOut()">Sign out</button>
-    </div>
+  <!-- Chat view (hidden until logged in).
+       #chat is what the script shows and hides with an inline style; #shell
+       inside it is what does the layout. Keeping those two jobs on separate
+       elements is why an inline `display: block` cannot flatten the grid.
 
-    <div class="row" id="newroom">
-      <input id="roomname" placeholder="new room name" autocomplete="off">
-      <button onclick="createRoom()">Create</button>
-    </div>
+       The inline `display: none` is the INITIAL state, and it has to be an inline
+       style rather than the hidden attribute — the script reveals this element with
+       `style.display = 'block'`, and [hidden] is !important above, so a hidden
+       attribute here could never be undone.
 
-    <!-- Who's online. Filled from GET /rooms/{id}/presence, which reads Redis —
-         so it shows people on the OTHER gateway too, not just this one. -->
-    <div id="online"><span class="label">Online</span> <span id="onlinenames">—</span></div>
+       Without it nothing hid this element on first paint: the script only ever sets
+       display in RESPONSE to an event, so before anyone logs in the entire shell
+       rendered directly underneath the login card. -->
+  <div id="chat" style="display: none">
+   <div id="shell">
 
-    <!-- Forces every call through the TURN relay, so the relay path can be
-         tested and measured without needing a network hostile enough to make
-         a direct connection fail on its own. -->
-    <label id="relaytoggle"><input type="checkbox" id="forcerelay"> force relay (TURN only)</label>
+    <aside id="sidebar">
+      <div class="brand">chat-go</div>
 
-    <!-- Somebody is calling us. Hidden until an offer arrives. -->
-    <div id="ringing" hidden>
-      <span id="ringingwho"></span>
-      <button class="accept" onclick="acceptCall()">Accept</button>
-      <button class="reject" onclick="rejectCall()">Reject</button>
-    </div>
-
-    <!-- The call itself. `muted` on the local video stops you hearing yourself. -->
-    <div id="callarea" hidden>
-      <video id="localvideo" autoplay muted playsinline></video>
-      <video id="remotevideo" autoplay playsinline></video>
-      <div id="callinfo"></div>
-      <button class="hangup" onclick="hangUp()">Hang up</button>
-    </div>
-
-    <div id="messages"></div>
-    <div class="row">
-      <input id="input" placeholder="type a message and hit Enter…" autocomplete="off">
-      <button onclick="send()">Send</button>
-      <button onclick="catchup()" title="Summarise what you missed">Catch me up</button>
-    </div>
-
-    <!-- Streaming summary lands here, a fragment at a time -->
-    <div id="summary"></div>
-
-    <!-- Semantic search: finds messages by MEANING, not by keyword -->
-    <div id="searchbox">
-      <div class="row">
-        <input id="q" placeholder="search by meaning, e.g. “the broker went down”" autocomplete="off">
-        <button onclick="search()">Search</button>
+      <div>
+        <!-- One button per room. Filled from GET /rooms, which also says which
+             ones we are already a member of. -->
+        <div class="side-label">Rooms</div>
+        <div id="rooms"></div>
       </div>
-      <div id="results"></div>
-    </div>
+
+      <div class="row" id="newroom">
+        <input id="roomname" placeholder="new room" autocomplete="off">
+        <button onclick="createRoom()">Create</button>
+      </div>
+
+      <div>
+        <!-- Who's online. Filled from GET /rooms/{id}/presence, which reads
+             Redis — so it shows people connected to the OTHER gateway too. -->
+        <div class="side-label">Online</div>
+        <div id="onlinenames"><span class="empty">nobody yet</span></div>
+      </div>
+
+      <div class="spacer"></div>
+
+      <!-- Forces every call through the TURN relay, so the relay path can be
+           tested and measured without needing a network hostile enough to make
+           a direct connection fail on its own. -->
+      <label id="relaytoggle"><input type="checkbox" id="forcerelay"> force relay (TURN only)</label>
+      <button id="signout" onclick="signOut()">Sign out</button>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <span id="roomtitle">general</span>
+        <span class="grow"></span>
+        <!-- Semantic search: finds messages by MEANING, not by keyword. In the
+             header because it searches the room you are looking at. -->
+        <input id="q" placeholder="search by meaning…" autocomplete="off"
+               onkeydown="if(event.key==='Enter')search()">
+        <button onclick="search()">Search</button>
+        <button id="catchup" onclick="catchup()" title="Summarise what you missed">Catch me up</button>
+      </header>
+
+      <div id="scroll">
+        <!-- Somebody is calling us. Hidden until an offer arrives. -->
+        <div id="ringing" hidden>
+          <span id="ringingwho"></span>
+          <button class="accept" onclick="acceptCall()">Accept</button>
+          <button class="reject" onclick="rejectCall()">Reject</button>
+        </div>
+
+        <!-- The call itself. `muted` on the local video stops you hearing
+             yourself through your own speakers, which the mic then picks up. -->
+        <div id="callarea" hidden>
+          <div id="videos">
+            <video id="localvideo" autoplay muted playsinline></video>
+            <video id="remotevideo" autoplay playsinline></video>
+          </div>
+          <div id="callinfo"></div>
+          <button class="hangup" onclick="hangUp()">Hang up</button>
+        </div>
+
+        <!-- Streaming summary lands here, a fragment at a time. Doubles as the
+             error panel — see #summary.error in the stylesheet. -->
+        <div id="summary"></div>
+
+        <div id="results"></div>
+
+        <div id="messages"></div>
+      </div>
+
+      <div id="composer">
+        <input id="input" placeholder="type a message and hit Enter…" autocomplete="off">
+        <button onclick="send()">Send</button>
+      </div>
+    </main>
+
+   </div>
   </div>
 
   <script>
@@ -579,7 +896,13 @@
       for (const r of rooms) {
         const b = document.createElement('button');
         b.textContent = r.name;                // textContent, so a room named "<b>" can't inject markup
-        if (r.id === room) b.className = 'current';
+        if (r.id === room) {
+          b.className = 'current';
+          // The header names the room you are actually reading. Set here rather
+          // than in switchRoom, because this is the one place that knows a room
+          // id's NAME — switchRoom only ever sees the id.
+          document.getElementById('roomtitle').textContent = r.name;
+        }
         else if (!r.member) b.className = 'guest';
         b.onclick = () => switchRoom(r.id);
         bar.appendChild(b);
@@ -653,7 +976,7 @@
       localStorage.removeItem('chat_token');
       localStorage.removeItem('chat_room');
       document.getElementById('messages').textContent = '';
-      document.getElementById('onlinenames').textContent = '—';
+      setOnlineEmpty('nobody yet');
       document.getElementById('rooms').textContent = '';
       document.getElementById('summary').style.display = 'none';
       document.getElementById('chat').style.display = 'none';
@@ -764,7 +1087,7 @@
       // The online list belongs to the room we're LEAVING, so clear it too.
       // Without this, switching rooms briefly shows the old room's members as if
       // they were in the new one.
-      document.getElementById('onlinenames').textContent = '—';
+      setOnlineEmpty('nobody yet');
 
       // Work out which room to open BEFORE trying to join one.
       //
@@ -924,21 +1247,79 @@
       input.value = '';
     }
 
+    // The online list's empty state.
+    //
+    // A function rather than `textContent = '...'` because the placeholder needs
+    // the .empty class to look like an absence instead of like a person — and
+    // assigning textContent would wipe the element's children, class and all.
+    function setOnlineEmpty(text) {
+      const box = document.getElementById('onlinenames');
+      box.textContent = '';
+      const span = document.createElement('span');
+      span.className = 'empty';
+      span.textContent = text;
+      box.appendChild(span);
+    }
+
+    // Who am I, for deciding which messages are mine.
+    //
+    // Read out of the JWT rather than kept as a second variable: the token is
+    // already the authority on who you are, and a separate copy is a thing that
+    // can disagree with it after a sign-out or a token swap. Memoised on the
+    // token string, so switching accounts invalidates it for free.
+    //
+    // DISPLAY ONLY. This decodes the payload without verifying the signature,
+    // which is fine for choosing a bubble colour and would be a hole for
+    // anything else — the server never trusts a claim this function returns.
+    let _nameCache = { token: '', name: '' };
+    function myUsername() {
+      const t = localStorage.getItem('chat_token') || '';
+      if (t !== _nameCache.token) {
+        let name = '';
+        try {
+          // base64url -> base64 before atob: JWTs use - and _ where base64
+          // uses + and /, and atob rejects the former.
+          const payload = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+          name = JSON.parse(atob(payload)).username || '';
+        } catch (e) {
+          name = '';   // malformed token: nothing is "mine", which is the safe default
+        }
+        _nameCache = { token: t, name };
+      }
+      return _nameCache.name;
+    }
+
     function addMessage(username, body, sentAt) {
       const messages = document.getElementById('messages');
+
       const div = document.createElement('div');
-      div.className = 'msg';
-      // Server sends UTC; the browser renders it in the viewer's own timezone.
+      div.className = 'msg' + (username === myUsername() ? ' own' : '');
+
+      // Name and time on their own line above the text, so a long message does
+      // not push the timestamp somewhere unreadable.
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const b = document.createElement('b');
+      b.textContent = username;                    // textContent = safe against HTML injection
       const time = document.createElement('span');
       time.className = 'time';
-      time.textContent = new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' ';
-      div.appendChild(time);
-      const b = document.createElement('b');
-      b.textContent = username;                       // textContent = safe against HTML injection
-      div.appendChild(b);
-      div.appendChild(document.createTextNode(': ' + body));
+      // Server sends UTC; the browser renders it in the viewer's own timezone.
+      time.textContent = new Date(sentAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      meta.appendChild(b);
+      meta.appendChild(time);
+
+      const text = document.createElement('div');
+      text.textContent = body;                     // again textContent, never innerHTML
+
+      div.appendChild(meta);
+      div.appendChild(text);
       messages.appendChild(div);
-      messages.scrollTop = messages.scrollHeight;     // auto-scroll to the newest message
+
+      // The SCROLLING element is #scroll now, not #messages — #messages is a
+      // plain flex column inside it. Scrolling the wrong one silently does
+      // nothing, and the symptom is just "new messages don't come into view".
+      const scroll = document.getElementById('scroll');
+      scroll.scrollTop = scroll.scrollHeight;
     }
 
     // ── Catch me up (streaming summary) ──────────────────────────────────────

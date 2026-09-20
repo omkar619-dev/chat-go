@@ -152,7 +152,11 @@ func main() {
 		pr.Get("/{id}/search", h.SearchRoom)     // semantic search over the room's history
 		pr.Get("/{id}/presence", h.RoomPresence) // who is online, across all gateways
 	})
-	r.Get("/ws", h.WS) // WebSocket upgrade; auth via ?token= query param
+	// WebSocket upgrade. Auth is a single-use ?ticket= minted by /ws-ticket above,
+	// NOT a JWT in the query string: a URL leaks into browser history, proxy logs
+	// and Referer headers, and a leaked JWT stays valid until it expires, whereas a
+	// ticket is redeemed with GETDEL and dies on first use. See B1 in docs/HARDENING.md.
+	r.Get("/ws", h.WS)
 
 	// 6. Wrap the router in an http.Server so we can shut it down on command.
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: r}
